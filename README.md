@@ -18,8 +18,8 @@ So: drive the real web app, record the responses, rebuild the thread offline.
 ## Layout
 
 ```
-src/capture.py            Playwright: open a chat, auto-scroll up, save every
-                          matching response to ./captures/
+src/capture.py            Playwright: arm on Enter, record the chat opening,
+                          auto-scroll up, save responses to data/captures/
 src/analyze/              Offline: read captures -> normalised chat -> HTML
   load.py                 find SlideMessage nodes in any capture shape
   parse.py                raw node -> render-ready message
@@ -29,6 +29,7 @@ src/analyze/              Offline: read captures -> normalised chat -> HTML
 src/inspect_captures.py   older ad-hoc explorer (kept for poking at new shapes)
 src/build_html.py         older generic renderer (superseded by src/analyze)
 data/sample/              two consecutive scrolls, used to develop the parser
+data/captures/            a real run's responses (gitignored)
 data/out/                 generated output (gitignored)
 ```
 
@@ -37,9 +38,33 @@ Everything stays local. `data/` is gitignored. The only network access in
 
 ## Use
 
+### Capture
+
+```bash
+python src/capture.py
+```
+
+Recording is off until you press Enter, and you press it **before** opening the
+chat — so the first thread request, the bottom of the conversation, is recorded
+too. After that the script waits for the chat to actually open (it watches for the
+first response carrying messages), settles, then scrolls on its own.
+
+It stops when Instagram reports `has_next_page: false` and two more scrolls stay
+quiet, or after 10 scrolls with nothing new — and tells you which of the two
+happened, so you know whether you really reached the top. Re-running continues the
+file numbering instead of overwriting the previous run.
+
+### Rebuild
+
+```bash
+python -m src.analyze report data/captures
+python -m src.analyze build  data/captures --me <your-username> --media
+```
+
+The same commands work on the bundled sample:
+
 ```bash
 python -m src.analyze report data/sample
-python -m src.analyze build  data/sample --me <your-username> --title "Chat"
 python -m src.analyze build  data/sample --me <your-username> --media
 ```
 
@@ -109,6 +134,21 @@ message inside the same two scrolls.
   cursor chain, which needs the *request* variables — `capture.py` records those, so
   `report` verifies it automatically on real captures (the raw sample bodies can't be
   checked and the report says so).
-- `capture.py` strips auth tokens (`fb_dtsg`, `lsd`, …) before writing anything.
+- `capture.py` strips auth tokens (`fb_dtsg`, `lsd`, …) before writing anything, and
+  writes under `data/` so the gitignore covers captured conversations.
 - `src/analyze` reads raw response bodies, `capture.py` records, lists of either,
   and `.jsonl` — so it works on `data/sample` and on a full run unchanged.
+
+
+
+-----------
+
+Instagram reports no older messages left — reached the top of the thread.
+
+935 responses in /home/fahed/Fahed/Personal/scrape-instagram/data/captures
+18636 unique messages across 932 thread pages
+range: 2020-03-26 13:04  ..  2024-10-24 18:51
+
+Next: python -m src.analyze report data/captures
+
+-----------

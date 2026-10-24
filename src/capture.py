@@ -4,13 +4,22 @@ Capture Instagram DM network responses while auto-scrolling a chat upward.
 Usage:
     pip install playwright
     playwright install chromium
-    python capture.py
+    python src/capture.py
 
-1. A Chromium window opens (persistent profile in ./.ig-profile, so you log in once).
-2. Log in, open the chat you want, then press Enter in this terminal.
-3. The script scrolls the chat to the top repeatedly and saves every matching
-   response to ./captures/. It stops when nothing new loads for a while.
-   Ctrl+C is safe at any time: every response is written to disk as it arrives.
+How a run goes:
+
+1. A Chromium window opens (persistent profile in ./.ig-profile, so you log in once)
+   and lands on the DM inbox. Nothing is recorded yet.
+2. Log in if needed and STAY on the inbox — do not open the chat yet. Press Enter
+   in this terminal: that arms the recorder.
+3. Now open the chat you want. The very first thread request — the one that paints
+   the bottom of the conversation — is recorded too, so the archive has its
+   starting point.
+4. As soon as that first page of messages lands, the script starts scrolling up and
+   keeps recording until the thread runs out or nothing new loads for a while.
+
+Ctrl+C is safe at any time: every response is written to disk as it arrives.
+Output goes to data/captures/, which is gitignored — keep it that way.
 """
 
 import asyncio
@@ -18,13 +27,15 @@ import json
 import random
 import re
 import time
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs
 
 from playwright.async_api import async_playwright
 
-OUT = Path("captures")
-PROFILE = Path(".ig-profile")
+ROOT = Path(__file__).resolve().parent.parent
+OUT = ROOT / "data" / "captures"      # under data/ so .gitignore covers it
+PROFILE = ROOT / ".ig-profile"
 
 # Responses whose URL contains any of these get saved.
 URL_PATTERNS = ("/graphql", "/api/graphql", "/api/v1/direct_v2")
@@ -33,10 +44,32 @@ URL_PATTERNS = ("/graphql", "/api/graphql", "/api/v1/direct_v2")
 SECRET_FIELDS = {"fb_dtsg", "lsd", "jazoest", "__hs", "__hsi", "__rev", "__s", "__dyn", "__csr"}
 
 IDLE_ROUNDS_TO_STOP = 10        # stop after this many scrolls with no new data
+EXHAUSTED_CONFIRM = 2           # extra quiet scrolls after IG says there is no more
+SETTLE_SECONDS = 2.5            # let the chat finish opening before the first scroll
 SCROLL_DELAY = (1.8, 3.5)       # random pause between scrolls, seconds (be gentle)
 CAPTURE_WEBSOCKET = False       # set True to also log websocket text frames
 
-state = {"count": 0, "last_capture": time.time()}
+state = {
+    "armed": False,             # nothing is written until you press Enter
+    "count": 0,
+    "last_capture": time.time(),
+    "thread_pages": 0,          # responses that actually carried chat messages
+    "thread_fbid": None,
+    "message_ids": set(),
+    "oldest_ms": None,
+    "newest_ms": None,
+    "exhausted": False,         # IG said there is nothing older left
+}
+
+
+def walk(obj):
+    yield obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from walk(v)
 
 
 def parse_body(text: str):
@@ -78,7 +111,49 @@ def clean_request(post_data: str | None):
     return form, friendly
 
 
+def note_thread(chunks) -> int:
+    """Track live progress from any slide_messages connection in the body.
+
+    Returns how many messages this response added that we had not seen before,
+    which is what tells the scroll loop whether it is still making progress.
+    """
+    added = 0
+    for obj in walk(chunks or []):
+        if not isinstance(obj, dict):
+            continue
+        conn = obj.get("slide_messages")
+        if not isinstance(conn, dict) or not isinstance(conn.get("edges"), list):
+            continue
+        state["thread_pages"] += 1
+        for edge in conn["edges"]:
+            node = (edge or {}).get("node") or {}
+            mid = node.get("message_id") or node.get("id")
+            if not mid or mid in state["message_ids"]:
+                continue
+            state["message_ids"].add(mid)
+            added += 1
+            state["thread_fbid"] = node.get("thread_fbid") or state["thread_fbid"]
+            ts = node.get("timestamp_ms")
+            if str(ts).isdigit():
+                ts = int(ts)
+                state["oldest_ms"] = min(ts, state["oldest_ms"] or ts)
+                state["newest_ms"] = max(ts, state["newest_ms"] or ts)
+        page_info = conn.get("page_info") or {}
+        # Edges come back newest-first, so the "next" page is the older one.
+        if page_info.get("has_next_page") is False:
+            state["exhausted"] = True
+    return added
+
+
+def next_seq() -> int:
+    """Continue numbering after an earlier run instead of overwriting it."""
+    seqs = [int(m.group(1)) for p in OUT.glob("*.json") if (m := re.match(r"(\d{5})_", p.name))]
+    return max(seqs, default=0)
+
+
 async def on_response(resp):
+    if not state["armed"]:
+        return
     url = resp.url
     if not any(p in url for p in URL_PATTERNS):
         return
@@ -90,6 +165,7 @@ async def on_response(resp):
     state["count"] += 1
     state["last_capture"] = time.time()
     name = re.sub(r"[^A-Za-z0-9_]+", "_", friendly or "unknown")[:60]
+    chunks = parse_body(body)
     record = {
         "seq": state["count"],
         "captured_at": time.time(),
@@ -98,21 +174,23 @@ async def on_response(resp):
         "friendly_name": friendly,
         "doc_id": form.get("doc_id"),
         "request": form,
-        "chunks": parse_body(body),
+        "chunks": chunks,
         "raw": None,
     }
-    if record["chunks"] is None:
+    if chunks is None:
         record["raw"] = body  # keep it so nothing is lost
     path = OUT / f"{state['count']:05d}_{name}.json"
     path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-    print(f"  saved {path.name} ({len(body):,} bytes)")
+    added = note_thread(chunks)
+    extra = f", +{added} messages" if added else ""
+    print(f"  saved {path.name} ({len(body):,} bytes{extra})")
 
 
 def on_websocket(ws):
     log = OUT / "websocket_frames.jsonl"
 
     def frame(payload):
-        if isinstance(payload, str):
+        if state["armed"] and isinstance(payload, str):
             with log.open("a", encoding="utf-8") as f:
                 f.write(json.dumps({"t": time.time(), "url": ws.url, "data": payload}) + "\n")
             state["last_capture"] = time.time()
@@ -149,44 +227,102 @@ SCROLL_JS = r"""
 """
 
 
+def watch(page):
+    page.on("response", lambda r: asyncio.ensure_future(on_response(r)))
+    if CAPTURE_WEBSOCKET:
+        page.on("websocket", on_websocket)
+
+
+def when(ms):
+    return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M") if ms else "?"
+
+
+async def wait_for_chat_to_open():
+    """Block until the browser actually loads a page of messages."""
+    print("\nRecording is ON. Open the chat you want to archive in the browser.")
+    print("(The first request it makes is the bottom of the conversation — that is the")
+    print(" starting point the account export never gives you.)\n")
+    waited = 0.0
+    while state["thread_pages"] == 0:
+        await asyncio.sleep(0.5)
+        waited += 0.5
+        if waited % 20 == 0:
+            print(f"  still waiting for a thread to open... ({int(waited)}s, "
+                  f"{state['count']} unrelated responses recorded so far)")
+    print(f"\nThread {state['thread_fbid']} opened: {len(state['message_ids'])} messages so far.")
+    print(f"Letting it settle for {SETTLE_SECONDS}s before scrolling.")
+    await asyncio.sleep(SETTLE_SECONDS)
+
+
+async def scroll_loop(page):
+    print("\nScrolling. A dashed blue outline marks the pane being scrolled.")
+    print("If the wrong pane is outlined, click inside the chat messages and restart.\n")
+    last_height, idle, quiet_after_end, rounds = None, 0, 0, 0
+    while idle < IDLE_ROUNDS_TO_STOP:
+        rounds += 1
+        before_msgs = len(state["message_ids"])
+        info = await page.evaluate(SCROLL_JS)
+        if info is None:
+            print("Couldn't find a scrollable chat pane yet; retrying...")
+        await asyncio.sleep(random.uniform(*SCROLL_DELAY))
+        height = info and info["scrollHeight"]
+        new_msgs = len(state["message_ids"]) - before_msgs
+        idle = 0 if (height != last_height or new_msgs) else idle + 1
+        last_height = height
+        print(f"scroll {rounds:>3}: +{new_msgs} messages  total={len(state['message_ids'])}  "
+              f"oldest={when(state['oldest_ms'])}  idle={idle}")
+        if state["exhausted"]:
+            quiet_after_end = quiet_after_end + 1 if not new_msgs else 0
+            if quiet_after_end >= EXHAUSTED_CONFIRM:
+                print("\nInstagram reports no older messages left — reached the top of the thread.")
+                return
+    print(f"\nNo new messages for {IDLE_ROUNDS_TO_STOP} scrolls — stopping.")
+    if not state["exhausted"]:
+        print("Instagram never said the thread was exhausted, so this may not be the very top.")
+        print("Re-run and scroll again if you expect more; numbering continues where this left off.")
+
+
+def summary():
+    print(f"\n{state['count']} responses in {OUT}")
+    print(f"{len(state['message_ids'])} unique messages across {state['thread_pages']} thread pages")
+    if state["message_ids"]:
+        print(f"range: {when(state['oldest_ms'])}  ..  {when(state['newest_ms'])}")
+        print(f"\nNext: python -m src.analyze report data/captures")
+
+
 async def main():
-    OUT.mkdir(exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True)
+    state["count"] = next_seq()
+    if state["count"]:
+        print(f"{OUT} already holds {state['count']} responses; continuing after them.")
+
     async with async_playwright() as p:
         ctx = await p.chromium.launch_persistent_context(
             str(PROFILE), headless=False, viewport={"width": 1300, "height": 900}
         )
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        page.on("response", lambda r: asyncio.ensure_future(on_response(r)))
-        if CAPTURE_WEBSOCKET:
-            page.on("websocket", on_websocket)
+        watch(page)
+        ctx.on("page", watch)  # IG sometimes opens the thread in a new tab
 
         await page.goto("https://www.instagram.com/direct/inbox/")
         await asyncio.to_thread(
-            input, "\nLog in if needed, open the chat you want, then press Enter here... "
+            input,
+            "\nLog in if needed and STAY on the inbox — do NOT open the chat yet."
+            "\nPress Enter to start recording... ",
         )
+        state["armed"] = True
 
-        print("Scrolling. A dashed blue outline marks the pane being scrolled.")
-        print("If the wrong pane is outlined, click inside the chat messages and restart.\n")
-        last_height, idle = None, 0
-        while idle < IDLE_ROUNDS_TO_STOP:
-            before = state["count"]
-            info = await page.evaluate(SCROLL_JS)
-            if info is None:
-                print("Couldn't find a scrollable chat pane yet; retrying...")
-            await asyncio.sleep(random.uniform(*SCROLL_DELAY))
-            height = info and info["scrollHeight"]
-            grew = height != last_height
-            got_new = state["count"] > before
-            idle = 0 if (grew or got_new) else idle + 1
-            last_height = height
-            print(f"scroll: height={height} new_responses={state['count'] - before} idle={idle}")
-
-        print(f"\nDone. {state['count']} responses saved in ./{OUT}/")
-        await ctx.close()
+        try:
+            await wait_for_chat_to_open()
+            await scroll_loop(page)
+        finally:
+            state["armed"] = False
+            summary()
+            await ctx.close()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print(f"\nStopped. {state['count']} responses saved in ./{OUT}/")
+        print(f"\nStopped. {state['count']} responses saved in {OUT}")
