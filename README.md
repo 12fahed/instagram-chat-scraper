@@ -54,6 +54,18 @@ quiet, or after 10 scrolls with nothing new — and tells you which of the two
 happened, so you know whether you really reached the top. Re-running continues the
 file numbering instead of overwriting the previous run.
 
+**The browser is never closed behind your back.** Whatever ends the run — the top of
+the thread, a stall, a renderer crash, an unexpected error — the script prints what
+happened and leaves Chromium open. If the chat pane is still alive you can type `r`
+to carry on scrolling *from where it stopped*, which matters: a crash 1,100 pages in
+would otherwise mean walking the whole thread again. A transient `page.evaluate`
+failure is retried five times (re-finding the chat pane each time) before it counts
+as fatal.
+
+On a long run the likeliest crash is Chromium running out of memory — the chat pane
+keeps every message you scrolled past, plus its images, in the DOM. Nothing is lost
+when that happens: responses are written as they arrive.
+
 ### Rebuild
 
 ```bash

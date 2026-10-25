@@ -18,6 +18,12 @@ How a run goes:
 4. As soon as that first page of messages lands, the script starts scrolling up and
    keeps recording until the thread runs out or nothing new loads for a while.
 
+The browser is never closed behind your back. Whatever happens - the top of the
+thread, an idle stall, a renderer crash, an unexpected error - the script says what
+happened and leaves Chromium open, so you can look at the page and, when the chat
+pane is still alive, type `r` to carry on scrolling from exactly where it stopped
+instead of starting the whole thread again.
+
 Ctrl+C is safe at any time: every response is written to disk as it arrives.
 Output goes to data/captures/, which is gitignored — keep it that way.
 """
@@ -27,11 +33,12 @@ import json
 import random
 import re
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError, async_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "data" / "captures"      # under data/ so .gitignore covers it
@@ -44,6 +51,7 @@ URL_PATTERNS = ("/graphql", "/api/graphql", "/api/v1/direct_v2")
 SECRET_FIELDS = {"fb_dtsg", "lsd", "jazoest", "__hs", "__hsi", "__rev", "__s", "__dyn", "__csr"}
 
 IDLE_ROUNDS_TO_STOP = 10        # stop after this many scrolls with no new data
+MAX_SCROLL_FAILURES = 5         # consecutive failed scrolls before giving up
 EXHAUSTED_CONFIRM = 2           # extra quiet scrolls after IG says there is no more
 SETTLE_SECONDS = 2.5            # let the chat finish opening before the first scroll
 SCROLL_DELAY = (1.8, 3.5)       # random pause between scrolls, seconds (be gentle)
@@ -59,6 +67,7 @@ state = {
     "oldest_ms": None,
     "newest_ms": None,
     "exhausted": False,         # IG said there is nothing older left
+    "crashed": False,           # the renderer died (usually out of memory)
 }
 
 
@@ -237,13 +246,19 @@ def when(ms):
     return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M") if ms else "?"
 
 
-async def wait_for_chat_to_open():
-    """Block until the browser actually loads a page of messages."""
+async def wait_for_chat_to_open(page=None):
+    """Block until the browser actually loads a page of messages.
+
+    Returns False if the window went away while we were waiting, so the caller
+    can report that instead of spinning forever against a dead browser.
+    """
     print("\nRecording is ON. Open the chat you want to archive in the browser.")
     print("(The first request it makes is the bottom of the conversation — that is the")
     print(" starting point the account export never gives you.)\n")
     waited = 0.0
     while state["thread_pages"] == 0:
+        if page is not None and (state["crashed"] or page.is_closed()):
+            return False
         await asyncio.sleep(0.5)
         waited += 0.5
         if waited % 20 == 0:
@@ -252,16 +267,59 @@ async def wait_for_chat_to_open():
     print(f"\nThread {state['thread_fbid']} opened: {len(state['message_ids'])} messages so far.")
     print(f"Letting it settle for {SETTLE_SECONDS}s before scrolling.")
     await asyncio.sleep(SETTLE_SECONDS)
+    return True
 
 
-async def scroll_loop(page):
+def _page_gone(exc: BaseException, page) -> bool:
+    """Playwright does not export TargetClosedError, so match on the message too."""
+    if state["crashed"] or page.is_closed():
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "target page, context or browser has been closed",
+            "target closed",
+            "browser has been closed",
+            "page has been closed",
+            "connection closed",
+            "browser closed",
+        )
+    )
+
+
+async def scroll_loop(page) -> dict:
+    """Scroll until something stops us. Returns why, never raises for page trouble."""
     print("\nScrolling. A dashed blue outline marks the pane being scrolled.")
     print("If the wrong pane is outlined, click inside the chat messages and restart.\n")
-    last_height, idle, quiet_after_end, rounds = None, 0, 0, 0
+    last_height, idle, quiet_after_end, rounds, failures = None, 0, 0, 0, 0
+
     while idle < IDLE_ROUNDS_TO_STOP:
+        # The crash event can arrive between rounds, while evaluate() still
+        # happens to succeed against a half-dead page, so check it up front.
+        if state["crashed"] or page.is_closed():
+            return {
+                "reason": "page_gone",
+                "detail": "the renderer crashed" if state["crashed"] else "the page was closed",
+                "rounds": rounds,
+            }
         rounds += 1
         before_msgs = len(state["message_ids"])
-        info = await page.evaluate(SCROLL_JS)
+        try:
+            info = await page.evaluate(SCROLL_JS)
+            failures = 0
+        except (PlaywrightError, asyncio.TimeoutError) as exc:
+            first_line = str(exc).strip().splitlines()[0][:160]
+            if _page_gone(exc, page):
+                return {"reason": "page_gone", "detail": first_line, "rounds": rounds}
+            failures += 1
+            print(f"  scroll failed ({type(exc).__name__}: {first_line}) — "
+                  f"retry {failures}/{MAX_SCROLL_FAILURES}")
+            if failures >= MAX_SCROLL_FAILURES:
+                return {"reason": "scroll_failed", "detail": first_line, "rounds": rounds}
+            await asyncio.sleep(2 * failures)   # the pane is re-found on the next try
+            continue
+
         if info is None:
             print("Couldn't find a scrollable chat pane yet; retrying...")
         await asyncio.sleep(random.uniform(*SCROLL_DELAY))
@@ -271,15 +329,13 @@ async def scroll_loop(page):
         last_height = height
         print(f"scroll {rounds:>3}: +{new_msgs} messages  total={len(state['message_ids'])}  "
               f"oldest={when(state['oldest_ms'])}  idle={idle}")
+
         if state["exhausted"]:
             quiet_after_end = quiet_after_end + 1 if not new_msgs else 0
             if quiet_after_end >= EXHAUSTED_CONFIRM:
-                print("\nInstagram reports no older messages left — reached the top of the thread.")
-                return
-    print(f"\nNo new messages for {IDLE_ROUNDS_TO_STOP} scrolls — stopping.")
-    if not state["exhausted"]:
-        print("Instagram never said the thread was exhausted, so this may not be the very top.")
-        print("Re-run and scroll again if you expect more; numbering continues where this left off.")
+                return {"reason": "reached_top", "detail": None, "rounds": rounds}
+
+    return {"reason": "idle", "detail": None, "rounds": rounds}
 
 
 def summary():
@@ -287,7 +343,72 @@ def summary():
     print(f"{len(state['message_ids'])} unique messages across {state['thread_pages']} thread pages")
     if state["message_ids"]:
         print(f"range: {when(state['oldest_ms'])}  ..  {when(state['newest_ms'])}")
-        print(f"\nNext: python -m src.analyze report data/captures")
+
+
+def report_outcome(outcome: dict):
+    reason, detail = outcome["reason"], outcome.get("detail")
+    line = "=" * 72
+    print(f"\n{line}")
+    if reason == "reached_top":
+        print("REACHED THE TOP. Instagram reports no older messages in this thread.")
+        print(f"Oldest message captured: {when(state['oldest_ms'])}")
+    elif reason == "idle":
+        print(f"STALLED. No new messages for {IDLE_ROUNDS_TO_STOP} scrolls.")
+        if not state["exhausted"]:
+            print("Instagram never said the thread was exhausted, so this is probably")
+            print("NOT the top — the chat pane may have stopped loading. Try resuming.")
+    elif reason == "page_gone":
+        print("THE BROWSER PAGE IS GONE — it was closed, or the renderer crashed.")
+        print("On a long run this is usually Chromium running out of memory: the chat")
+        print("pane holds every message you scrolled past, plus their images.")
+        print(f"Playwright said: {detail}")
+        print("\nEverything captured so far is already on disk. Re-run the script to")
+        print("continue; file numbering carries on and the analyser de-duplicates.")
+    elif reason == "scroll_failed":
+        print(f"SCROLLING FAILED {MAX_SCROLL_FAILURES} times in a row.")
+        print(f"Playwright said: {detail}")
+    elif reason == "interrupted":
+        print("INTERRUPTED (Ctrl+C).")
+    else:
+        print("UNEXPECTED ERROR — everything captured so far is still on disk.")
+        print(detail or "")
+    print(line)
+
+
+async def hold_open(ctx, page, outcome: dict) -> bool:
+    """Keep Chromium alive and hand control back. True = resume scrolling."""
+    dead = outcome["reason"] == "page_gone"
+    if not dead:
+        try:
+            dead = page.is_closed()
+        except Exception:
+            dead = True
+
+    if dead:
+        print("\nThe browser window is gone, so scrolling cannot resume here.")
+        prompt = "Press Enter to exit... "
+    else:
+        print("\nThe browser is still open — go look at it if you want.")
+        if outcome["reason"] != "reached_top":
+            print("Scrolling can carry on from exactly where the chat pane is now,")
+            print("so you do not have to walk the whole thread again.")
+            prompt = "Type r then Enter to resume scrolling, or just Enter to close... "
+        else:
+            prompt = "Press Enter to close the browser... "
+
+    try:
+        answer = (await asyncio.to_thread(input, prompt)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    return answer == "r" and not dead and outcome["reason"] != "reached_top"
+
+
+def watch_for_crash(page):
+    def crashed(_=None):
+        state["crashed"] = True
+        print("\n  !! the page crashed (renderer died) — scrolling will stop")
+
+    page.on("crash", crashed)
 
 
 async def main():
@@ -298,10 +419,16 @@ async def main():
 
     async with async_playwright() as p:
         ctx = await p.chromium.launch_persistent_context(
-            str(PROFILE), headless=False, viewport={"width": 1300, "height": 900}
+            str(PROFILE),
+            headless=False,
+            viewport={"width": 1300, "height": 900},
+            # Long runs keep thousands of messages and their images alive in the
+            # chat pane; a small /dev/shm is a common way for that to end badly.
+            args=["--disable-dev-shm-usage"],
         )
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         watch(page)
+        watch_for_crash(page)
         ctx.on("page", watch)  # IG sometimes opens the thread in a new tab
 
         await page.goto("https://www.instagram.com/direct/inbox/")
@@ -313,12 +440,32 @@ async def main():
         state["armed"] = True
 
         try:
-            await wait_for_chat_to_open()
-            await scroll_loop(page)
+            if not await wait_for_chat_to_open(page):
+                report_outcome({"reason": "page_gone",
+                                "detail": "closed before a chat was opened"})
+                raise SystemExit(1)
+            while True:
+                try:
+                    outcome = await scroll_loop(page)
+                except KeyboardInterrupt:
+                    outcome = {"reason": "interrupted", "detail": None}
+                except Exception:
+                    outcome = {"reason": "error", "detail": traceback.format_exc()}
+                state["armed"] = outcome["reason"] not in ("page_gone",)
+                summary()
+                report_outcome(outcome)
+                if not await hold_open(ctx, page, outcome):
+                    break
+                state["armed"] = True
+                print("\nResuming...\n")
         finally:
             state["armed"] = False
-            summary()
-            await ctx.close()
+            print(f"\nDone. {state['count']} responses in {OUT}")
+            print("Next: python -m src.analyze report data/captures")
+            try:
+                await ctx.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
