@@ -31,7 +31,10 @@ Output goes to data/captures/, which is gitignored — keep it that way.
 import asyncio
 import json
 import random
+import os
 import re
+import signal
+import sys
 import time
 import traceback
 from datetime import datetime
@@ -68,7 +71,98 @@ state = {
     "newest_ms": None,
     "exhausted": False,         # IG said there is nothing older left
     "crashed": False,           # the renderer died (usually out of memory)
+    "pause": False,             # Ctrl+C asked us to pause at the end of this round
+    "quit": False,              # Ctrl+C again: stop altogether
+    "prompt": None,             # the future a waiting prompt is parked on, if any
+    "scrolling": False,         # only pause/stop the scroll while there is one
 }
+
+
+async def ainput(prompt: str) -> str:
+    """Read one line without blocking the event loop and without a helper thread.
+
+    Not asyncio.to_thread(input) and not a daemon thread: either leaves a thread
+    blocked in input() holding the stdin lock, and the interpreter then dies with
+    "_enter_buffered_busy: could not acquire lock for <stdin>" on Ctrl+C. Reading
+    through the loop has no thread to strand, and cancellation works normally.
+
+    Blocking the loop with a plain input() is also not an option: a pause can last
+    minutes, and Playwright needs the loop running to keep its connection alive.
+    """
+    loop = asyncio.get_running_loop()
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    future = loop.create_future()
+    buffer = bytearray()
+    fd = sys.stdin.fileno()
+
+    def readable():
+        try:
+            chunk = os.read(fd, 1024)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError as exc:
+            if not future.done():
+                future.set_exception(exc)
+            return
+        if not chunk:                      # EOF
+            if not future.done():
+                future.set_result(buffer.decode(errors="replace"))
+            return
+        buffer.extend(chunk)
+        if b"\n" in buffer and not future.done():
+            future.set_result(buffer.split(b"\n", 1)[0].decode(errors="replace"))
+
+    try:
+        loop.add_reader(fd, readable)
+    except (NotImplementedError, OSError, ValueError):
+        return await asyncio.to_thread(input)   # Windows and other odd stdin
+    state["prompt"] = future
+    try:
+        return await future
+    finally:
+        state["prompt"] = None
+        try:
+            loop.remove_reader(fd)
+        except (NotImplementedError, OSError, ValueError):
+            pass
+
+
+def install_pause_handler() -> bool:
+    """Ctrl+C pauses the scroll instead of killing the run.
+
+    While scrolling: first Ctrl+C pauses, a second one stops.
+    While a prompt is waiting: Ctrl+C answers it with "stop".
+
+    The handler is installed once and never removed. Taking it off would call
+    loop.remove_signal_handler(), which overwrites asyncio.Runner's own SIGINT
+    handler with the plain default - and then Ctrl+C raises KeyboardInterrupt
+    inside the selector instead of cancelling cleanly, with a traceback to match.
+
+    Returns False where the platform has no signal handler support (Windows),
+    in which case Ctrl+C keeps its usual meaning.
+    """
+    def on_sigint():
+        waiting = state["prompt"]
+        if waiting is not None and not waiting.done():
+            print("\n  Ctrl+C — stopping.")
+            waiting.set_result("")       # same as answering the prompt with Enter
+            return
+        if not state["scrolling"]:
+            return                       # already stopping; do not confuse the user
+        if state["pause"]:
+            state["quit"] = True
+            print("\n  Ctrl+C again — stopping after this scroll.")
+        else:
+            state["pause"] = True
+            print("\n  Ctrl+C — pausing after this scroll (again to stop).")
+
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGINT, on_sigint)
+        return True
+    except (NotImplementedError, RuntimeError):
+        return False
 
 
 def walk(obj):
@@ -293,49 +387,56 @@ async def scroll_loop(page) -> dict:
     print("\nScrolling. A dashed blue outline marks the pane being scrolled.")
     print("If the wrong pane is outlined, click inside the chat messages and restart.\n")
     last_height, idle, quiet_after_end, rounds, failures = None, 0, 0, 0, 0
+    state["scrolling"] = True
+    try:
+        while idle < IDLE_ROUNDS_TO_STOP:
+            if state["quit"]:
+                return {"reason": "interrupted", "detail": None, "rounds": rounds}
+            if state["pause"]:
+                return {"reason": "paused", "detail": None, "rounds": rounds}
+            # The crash event can arrive between rounds, while evaluate() still
+            # happens to succeed against a half-dead page, so check it up front.
+            if state["crashed"] or page.is_closed():
+                return {
+                    "reason": "page_gone",
+                    "detail": "the renderer crashed" if state["crashed"] else "the page was closed",
+                    "rounds": rounds,
+                }
+            rounds += 1
+            before_msgs = len(state["message_ids"])
+            try:
+                info = await page.evaluate(SCROLL_JS)
+                failures = 0
+            except (PlaywrightError, asyncio.TimeoutError) as exc:
+                first_line = str(exc).strip().splitlines()[0][:160]
+                if _page_gone(exc, page):
+                    return {"reason": "page_gone", "detail": first_line, "rounds": rounds}
+                failures += 1
+                print(f"  scroll failed ({type(exc).__name__}: {first_line}) — "
+                      f"retry {failures}/{MAX_SCROLL_FAILURES}")
+                if failures >= MAX_SCROLL_FAILURES:
+                    return {"reason": "scroll_failed", "detail": first_line, "rounds": rounds}
+                await asyncio.sleep(2 * failures)   # the pane is re-found on the next try
+                continue
 
-    while idle < IDLE_ROUNDS_TO_STOP:
-        # The crash event can arrive between rounds, while evaluate() still
-        # happens to succeed against a half-dead page, so check it up front.
-        if state["crashed"] or page.is_closed():
-            return {
-                "reason": "page_gone",
-                "detail": "the renderer crashed" if state["crashed"] else "the page was closed",
-                "rounds": rounds,
-            }
-        rounds += 1
-        before_msgs = len(state["message_ids"])
-        try:
-            info = await page.evaluate(SCROLL_JS)
-            failures = 0
-        except (PlaywrightError, asyncio.TimeoutError) as exc:
-            first_line = str(exc).strip().splitlines()[0][:160]
-            if _page_gone(exc, page):
-                return {"reason": "page_gone", "detail": first_line, "rounds": rounds}
-            failures += 1
-            print(f"  scroll failed ({type(exc).__name__}: {first_line}) — "
-                  f"retry {failures}/{MAX_SCROLL_FAILURES}")
-            if failures >= MAX_SCROLL_FAILURES:
-                return {"reason": "scroll_failed", "detail": first_line, "rounds": rounds}
-            await asyncio.sleep(2 * failures)   # the pane is re-found on the next try
-            continue
+            if info is None:
+                print("Couldn't find a scrollable chat pane yet; retrying...")
+            await asyncio.sleep(random.uniform(*SCROLL_DELAY))
+            height = info and info["scrollHeight"]
+            new_msgs = len(state["message_ids"]) - before_msgs
+            idle = 0 if (height != last_height or new_msgs) else idle + 1
+            last_height = height
+            print(f"scroll {rounds:>3}: +{new_msgs} messages  total={len(state['message_ids'])}  "
+                  f"oldest={when(state['oldest_ms'])}  idle={idle}")
 
-        if info is None:
-            print("Couldn't find a scrollable chat pane yet; retrying...")
-        await asyncio.sleep(random.uniform(*SCROLL_DELAY))
-        height = info and info["scrollHeight"]
-        new_msgs = len(state["message_ids"]) - before_msgs
-        idle = 0 if (height != last_height or new_msgs) else idle + 1
-        last_height = height
-        print(f"scroll {rounds:>3}: +{new_msgs} messages  total={len(state['message_ids'])}  "
-              f"oldest={when(state['oldest_ms'])}  idle={idle}")
+            if state["exhausted"]:
+                quiet_after_end = quiet_after_end + 1 if not new_msgs else 0
+                if quiet_after_end >= EXHAUSTED_CONFIRM:
+                    return {"reason": "reached_top", "detail": None, "rounds": rounds}
 
-        if state["exhausted"]:
-            quiet_after_end = quiet_after_end + 1 if not new_msgs else 0
-            if quiet_after_end >= EXHAUSTED_CONFIRM:
-                return {"reason": "reached_top", "detail": None, "rounds": rounds}
-
-    return {"reason": "idle", "detail": None, "rounds": rounds}
+        return {"reason": "idle", "detail": None, "rounds": rounds}
+    finally:
+        state["scrolling"] = False
 
 
 def summary():
@@ -349,7 +450,12 @@ def report_outcome(outcome: dict):
     reason, detail = outcome["reason"], outcome.get("detail")
     line = "=" * 72
     print(f"\n{line}")
-    if reason == "reached_top":
+    if reason == "paused":
+        print("PAUSED. Recording is OFF — nothing is being written while paused.")
+        print(f"Captured so far: {len(state['message_ids'])} messages back to "
+              f"{when(state['oldest_ms'])}")
+        print("The chat pane keeps its position, so resuming carries on from here.")
+    elif reason == "reached_top":
         print("REACHED THE TOP. Instagram reports no older messages in this thread.")
         print(f"Oldest message captured: {when(state['oldest_ms'])}")
     elif reason == "idle":
@@ -387,18 +493,24 @@ async def hold_open(ctx, page, outcome: dict) -> bool:
     if dead:
         print("\nThe browser window is gone, so scrolling cannot resume here.")
         prompt = "Press Enter to exit... "
+    elif outcome["reason"] == "paused":
+        print("\nThe browser is yours — scroll, open a reply, let things load.")
+        print("Nothing is recorded until you resume, so you can move around freely.")
+        prompt = "Type r then Enter to resume recording and scrolling, or just Enter to stop... "
+    elif outcome["reason"] != "reached_top":
+        print("\nThe browser is still open — go look at it if you want.")
+        print("Scrolling can carry on from exactly where the chat pane is now,")
+        print("so you do not have to walk the whole thread again.")
+        prompt = "Type r then Enter to resume scrolling, or just Enter to close... "
     else:
         print("\nThe browser is still open — go look at it if you want.")
-        if outcome["reason"] != "reached_top":
-            print("Scrolling can carry on from exactly where the chat pane is now,")
-            print("so you do not have to walk the whole thread again.")
-            prompt = "Type r then Enter to resume scrolling, or just Enter to close... "
-        else:
-            prompt = "Press Enter to close the browser... "
+        prompt = "Press Enter to close the browser... "
 
     try:
-        answer = (await asyncio.to_thread(input, prompt)).strip().lower()
-    except (EOFError, KeyboardInterrupt):
+        answer = (await ainput(prompt)).strip().lower()
+    except (EOFError, KeyboardInterrupt, asyncio.CancelledError):
+        # asyncio.run() turns a Ctrl+C here into CancelledError, and re-raises
+        # KeyboardInterrupt itself once we return - so treat all of them as "stop".
         answer = ""
     return answer == "r" and not dead and outcome["reason"] != "reached_top"
 
@@ -432,10 +544,9 @@ async def main():
         ctx.on("page", watch)  # IG sometimes opens the thread in a new tab
 
         await page.goto("https://www.instagram.com/direct/inbox/")
-        await asyncio.to_thread(
-            input,
+        await ainput(
             "\nLog in if needed and STAY on the inbox — do NOT open the chat yet."
-            "\nPress Enter to start recording... ",
+            "\nPress Enter to start recording... "
         )
         state["armed"] = True
 
@@ -444,20 +555,24 @@ async def main():
                 report_outcome({"reason": "page_gone",
                                 "detail": "closed before a chat was opened"})
                 raise SystemExit(1)
+            if install_pause_handler():
+                print("Ctrl+C pauses the scroll (Ctrl+C twice stops).")
             while True:
+                state["pause"] = state["quit"] = False
                 try:
                     outcome = await scroll_loop(page)
                 except KeyboardInterrupt:
                     outcome = {"reason": "interrupted", "detail": None}
                 except Exception:
                     outcome = {"reason": "error", "detail": traceback.format_exc()}
-                state["armed"] = outcome["reason"] not in ("page_gone",)
+                # Paused means recording off, as does a page we can no longer reach.
+                state["armed"] = outcome["reason"] not in ("paused", "page_gone")
                 summary()
                 report_outcome(outcome)
                 if not await hold_open(ctx, page, outcome):
                     break
                 state["armed"] = True
-                print("\nResuming...\n")
+                print("\nResuming — recording is back ON.\n")
         finally:
             state["armed"] = False
             print(f"\nDone. {state['count']} responses in {OUT}")

@@ -54,6 +54,13 @@ quiet, or after 10 scrolls with nothing new — and tells you which of the two
 happened, so you know whether you really reached the top. Re-running continues the
 file numbering instead of overwriting the previous run.
 
+**Ctrl+C pauses rather than quits.** The first Ctrl+C stops scrolling at the end of
+the current round and **turns recording off**, so you can scroll, open a reply or
+go look at something else without any of it landing in `data/captures`. Then type
+`r` to resume (recording comes back on and the scroll continues from where the pane
+is), or just Enter to stop. A second Ctrl+C stops the run — in-loop if it lands
+before the round ends, otherwise by answering the pause prompt; either way it stops.
+
 **The browser is never closed behind your back.** Whatever ends the run — the top of
 the thread, a stall, a renderer crash, an unexpected error — the script prints what
 happened and leaves Chromium open. If the chat pane is still alive you can type `r`
