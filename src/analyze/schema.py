@@ -12,8 +12,25 @@ from datetime import datetime, timedelta
 
 from .parse import normalise, parse_content
 
-KNOWN_CONTENT = {"SlideMessageText", "SlideMessageAdminText", "SlideMessageXMAContent"}
-KNOWN_XMA = {"SlideMessagePortraitXMA", "SlideMessageStandardXMA", "SlideMessagePlaceholderXMA"}
+KNOWN_CONTENT = {
+    "SlideMessageText",
+    "SlideMessageAdminText",
+    "SlideMessageXMAContent",
+    "SlideMessageImageContent",
+    "SlideMessageRavenImageContent",
+    "SlideMessageRavenVideoContent",
+    "SlideMessageAnimatedMediaContent",
+    None,  # content: null / content_type NOT_SET - rendered as "Message removed"
+}
+KNOWN_XMA = {
+    "SlideMessagePortraitXMA",
+    "SlideMessageStandardXMA",
+    "SlideMessagePlaceholderXMA",
+    "SlideMessageExpiredPlaceholderXMA",
+}
+
+PAGES_SHOWN = 3        # head and tail of the page list; the middle is summarised
+GAPS_SHOWN = 5         # only the longest quiet stretches between pages
 
 # Fields the renderer reads. Anything else on a node is listed as "carried but unused"
 # so a new IG feature (polls, voice notes, ...) is visible rather than silent.
@@ -27,7 +44,7 @@ USED_NODE_KEYS = {
 def _cursors(page) -> set:
     pi = page.page_info or {}
     out = {pi.get("start_cursor"), pi.get("end_cursor")}
-    out.update(n.get("cursor") for n in page.nodes if isinstance(n, dict))
+    out.update(page.edge_cursors)
     return {c for c in out if c}
 
 
@@ -52,16 +69,27 @@ def report(pages: list, chat: dict) -> str:
 
     w("PAGES")
     rows = []
-    for p in pages:
-        rng = p.ts_range
-        pi = p.page_info or {}
-        rows.append((p.source, len(p.nodes), rng, pi))
-    for source, count, rng, pi in rows:
+    for page in pages:
+        pi = page.page_info or {}
+        rows.append((page.source, len(page.nodes), page.ts_range, pi))
+
+    def page_line(source, count, rng, pi):
         span = f"{_when(rng[0])}  ->  {_when(rng[1])}" if rng else "no timestamps"
-        w(f"  {source:<28} {count:>4} messages   {span}")
-        if pi:
-            w(f"  {'':<28}      prev={pi.get('has_previous_page')} next={pi.get('has_next_page')}"
-              f"  start={str(pi.get('start_cursor'))[:14]}… end={str(pi.get('end_cursor'))[:14]}…")
+        w(f"  {source:<40} {count:>4} messages   {span}")
+
+    if len(rows) <= PAGES_SHOWN * 2 + 1:
+        for row in rows:
+            page_line(*row)
+    else:
+        for row in rows[:PAGES_SHOWN]:
+            page_line(*row)
+        middle = rows[PAGES_SHOWN:-PAGES_SHOWN]
+        w(f"  ... {len(middle)} more pages, {sum(r[1] for r in middle):,} messages ...")
+        for row in rows[-PAGES_SHOWN:]:
+            page_line(*row)
+    sizes = Counter(r[1] for r in rows)
+    w(f"  {len(rows)} pages, {sizes.most_common(1)[0][0]} messages each "
+      f"({sizes.most_common(1)[0][1]} of them)")
 
     msgs = chat["messages"]
     total_nodes = sum(len(p.nodes) for p in pages)
@@ -80,21 +108,28 @@ def report(pages: list, chat: dict) -> str:
     # Pages come back newest-first and are contiguous by construction, so a time
     # gap between two pages is normally just a quiet stretch in the chat. The only
     # hard evidence that a scroll step was dropped is the cursor chain: the cursor a
-    # request asked for must be one the previous page handed out.
+    # request asked for must be one some captured page handed out.
     ranged = sorted([p for p in pages if p.ts_range], key=lambda p: -p.ts_range[1])
     w("")
-    w("CONTINUITY  (newest page first)")
+    w("CONTINUITY")
     if not ranged:
         w("  nothing to check")
-    for i, page in enumerate(ranged):
-        lo, hi = page.ts_range
-        w(f"  {page.source:<28} {_when(lo)}  ..  {_when(hi)}")
-        if i + 1 < len(ranged):
-            nxt_hi = ranged[i + 1].ts_range[1]
-            delta = timedelta(milliseconds=lo - nxt_hi)
-            w(f"  {'':<28}      {_fmt_delta(delta)} to the next page down")
+    else:
+        w(f"  newest page  {ranged[0].source}  up to {_when(ranged[0].ts_range[1])}")
+        w(f"  oldest page  {ranged[-1].source}  back to {_when(ranged[-1].ts_range[0])}")
+        gaps = []
+        for newer, older in zip(ranged, ranged[1:]):
+            gaps.append((newer.ts_range[0] - older.ts_range[1], newer, older))
+        gaps.sort(key=lambda g: -g[0])
+        w(f"  longest quiet stretches between pages (not necessarily missing data):")
+        for delta, newer, older in gaps[:GAPS_SHOWN]:
+            w(f"    {_fmt_delta(timedelta(milliseconds=delta)):>10}  "
+              f"{_when(older.ts_range[1])} -> {_when(newer.ts_range[0])}")
 
-    chained = [p for p in pages if p.request_cursor]
+    # The bottom-of-thread page is fetched with a cursor the inbox handed out
+    # before recording started, so it can never chain. Everything after it must.
+    initial = ranged[0] if ranged else None
+    chained = [p for p in pages if p.request_cursor and p is not initial]
     w("")
     if not chained:
         w("  cursor chain: not checkable (captures hold responses only, no request variables)")
@@ -102,9 +137,12 @@ def report(pages: list, chat: dict) -> str:
         handed_out = {c for p in pages for c in _cursors(p)}
         orphans = [p for p in chained if p.request_cursor not in handed_out]
         if orphans:
-            for p in orphans:
-                w(f"  cursor chain: {p.source} asked for a cursor no captured page handed out"
-                  f" -> a scroll step is missing before it")
+            w(f"  cursor chain: {len(orphans)} of {len(chained)} paged requests asked for a cursor")
+            w(f"  no captured page handed out - a scroll step is missing before each of these:")
+            for p in orphans[:GAPS_SHOWN]:
+                w(f"    {p.source}")
+            if len(orphans) > GAPS_SHOWN:
+                w(f"    ... and {len(orphans) - GAPS_SHOWN} more")
         else:
             w(f"  cursor chain: all {len(chained)} paged requests follow a captured page")
 

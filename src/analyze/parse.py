@@ -17,9 +17,21 @@ reused on it to build the quoted preview.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 TOMBSTONE_TITLES = {"Message expired", "Message unavailable"}
+
+# Photos/videos/GIFs sent straight into the chat (as opposed to shared posts).
+# "Raven" is Meta's internal name for disappearing / view-once media. All four
+# expose the same url fields; they differ only in dict-vs-list and, for animated
+# media, in the url names.
+MEDIA_CONTENT = {
+    "SlideMessageImageContent": "image",
+    "SlideMessageRavenImageContent": "image",
+    "SlideMessageRavenVideoContent": "video",
+    "SlideMessageAnimatedMediaContent": "animation",
+}
 
 
 def _s(v: Any) -> str | None:
@@ -42,11 +54,92 @@ def _image(d: Any) -> dict | None:
     }
 
 
+# IG encodes the render size in the url as "_s<W>x<H>". A view-once photo that has
+# already been consumed comes back as a 12x12 blur with no larger url anywhere -
+# there is no image left to show, so such an attachment is dropped and the message
+# falls through to the "unavailable" tombstone.
+PLACEHOLDER_PX = 64
+
+
+def _render_px(url: str | None) -> int | None:
+    m = re.search(r"_s(\d+)x(\d+)", url or "")
+    return max(int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _usable(url: str | None) -> str | None:
+    px = _render_px(url)
+    return url if url and (px is None or px > PLACEHOLDER_PX) else None
+
+
+def _media_items(content: dict, typename: str) -> list[dict]:
+    animated = typename == "SlideMessageAnimatedMediaContent"
+    if animated:
+        raw = content.get("animated_media") or []
+    else:
+        one = content.get("attachment")
+        raw = [one] if isinstance(one, dict) else (content.get("attachments") or [])
+
+    items = []
+    for att in raw:
+        if not isinstance(att, dict):
+            continue
+        preview = _s(att.get("preview_cdn_url"))
+        if animated:
+            preview = preview or _s(att.get("attachment_webp_url"))
+            full = _s(att.get("attachment_mp4_url")) or _s(att.get("attachment_webp_url"))
+        else:
+            full = _s(att.get("attachment_cdn_url"))
+        # *_cdn_fallback_url is a bare path into IG's media_fallback endpoint, not a
+        # usable URL on its own, so it is deliberately ignored.
+        preview, full = _usable(preview), _usable(full)
+        if not preview and not full:
+            continue
+        items.append({
+            "kind": MEDIA_CONTENT[typename],
+            # No preview but a real original: show a labelled tile rather than
+            # stretching a blur placeholder across the bubble.
+            "preview": preview,
+            "placeholder": preview is None,
+            "full": full or preview,
+            "width": att.get("preview_width"),
+            "height": att.get("preview_height"),
+            "fbid": _s(att.get("attachment_fbid")),
+            "is_sticker": bool(att.get("is_sticker")),
+            "ephemeral": typename.startswith("SlideMessageRaven"),
+        })
+    return items
+
+
 def parse_content(node: dict) -> dict:
     """-> {kind, text, card} for a message node (or a replied_to_message node)."""
-    content = node.get("content") or {}
-    typename = content.get("__typename")
+    content = node.get("content")
     node_text = _s(node.get("text_body"))
+    if content is None:
+        # content_type NOT_SET with no tombstone_reason: an empty shell where a
+        # message used to be. Shown rather than dropped, so the archive stays honest.
+        return {"kind": "removed", "text": None, "card": None, "media": []}
+    typename = content.get("__typename")
+
+    if typename in MEDIA_CONTENT:
+        media = _media_items(content, typename)
+        if not media:
+            # A view-once photo that was consumed, or an attachment IG has dropped:
+            # the message is real but carries attachment: null / attachments: [].
+            label = {"image": "Photo", "video": "Video", "animation": "GIF"}[MEDIA_CONTENT[typename]]
+            return {
+                "kind": "unavailable",
+                "text": None,
+                "card": {"title": f"{label} unavailable",
+                         "caption": "The attachment is no longer available.",
+                         "variant": typename},
+                "media": [],
+            }
+        return {
+            "kind": "media",
+            "text": _s(content.get("caption")) or node_text,
+            "card": None,
+            "media": media,
+        }
 
     if typename == "SlideMessageAdminText":
         fragments = content.get("text_fragments") or []
@@ -55,6 +148,7 @@ def parse_content(node: dict) -> dict:
             "kind": "admin",
             "text": text or node_text,
             "card": None,
+            "media": [],
             "is_reaction_log": bool(content.get("is_reaction_action_log")),
         }
 
@@ -82,19 +176,25 @@ def parse_content(node: dict) -> dict:
         }
         # A card with no image, no link and a tombstone title is a dead message.
         if not image and not url and (title in TOMBSTONE_TITLES or not title):
-            return {"kind": "unavailable", "text": None, "card": card}
+            return {"kind": "unavailable", "text": None, "card": card, "media": []}
         kind = "story_share" if node.get("content_type") == "MONTAGE_SHARE_XMA" else "share"
-        return {"kind": kind, "text": _s(content.get("xma_text_body")) or node_text, "card": card}
+        return {"kind": kind, "text": _s(content.get("xma_text_body")) or node_text,
+                "card": card, "media": []}
 
     text = _s(content.get("text_body")) or node_text
-    return {"kind": "text" if text else "unknown", "text": text, "card": None}
+    return {"kind": "text" if text else "unknown", "text": text, "card": None, "media": []}
 
 
 def _reply(node: dict) -> dict | None:
     src = node.get("replied_to_message")
     if not isinstance(src, dict):
         rid = _s(node.get("replied_to_message_id"))
-        return {"id": rid, "sender_id": None, "sender_name": None, "kind": "unknown", "text": None, "card": None} if rid else None
+        return (
+            {"id": rid, "sender_id": None, "sender_name": None, "kind": "unknown",
+             "text": None, "card": None, "media": []}
+            if rid
+            else None
+        )
     parsed = parse_content(src)
     sender = src.get("sender") or {}
     return {
@@ -104,6 +204,7 @@ def _reply(node: dict) -> dict | None:
         "kind": parsed["kind"],
         "text": parsed["text"],
         "card": parsed["card"],
+        "media": parsed.get("media") or [],
     }
 
 
@@ -119,6 +220,10 @@ def participant(node: dict) -> dict | None:
         "name": _s(sender.get("name")) or _s(ud.get("full_name")),
         "username": _s(ud.get("username")),
         "avatar": _s(ud.get("profile_pic_url")),
+        # Deleted accounts and people who left come back with no user_dict and a
+        # blank name. They are real senders, but they should not turn a 1:1 chat
+        # into a "group" for rendering purposes.
+        "hydrated": bool(ud),
     }
 
 
@@ -138,6 +243,7 @@ def normalise(node: dict) -> dict:
         "kind": parsed["kind"],
         "text": parsed["text"],
         "card": parsed["card"],
+        "media": parsed.get("media") or [],
         "reply": _reply(node),
         "reactions": reactions,
         "is_reaction_log": parsed.get("is_reaction_log", False),
@@ -179,6 +285,10 @@ def build(pages: list) -> dict:
                 people.setdefault(reply["sender_id"], {"id": reply["sender_id"], "name": reply["sender_name"]})
 
     ordered = sorted(messages.values(), key=lambda m: (m["ts"] or 0, m["id"]))
+    for msg in ordered:
+        who = people.get(msg["sender_id"] or "")
+        if who is not None:
+            who["messages"] = who.get("messages", 0) + 1
     return {
         "thread_id": sorted(thread_ids)[0] if thread_ids else None,
         "people": people,

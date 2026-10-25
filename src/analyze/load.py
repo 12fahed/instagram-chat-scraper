@@ -63,6 +63,9 @@ class Page:
     # Cursor the request asked for, when the capture kept the request variables.
     # Chaining these is the only hard proof that no page was skipped.
     request_cursor: str | None = None
+    # Cursors this page handed out. They live on the *edge*, not the node, so they
+    # have to be kept here - nodes carry no cursor at all.
+    edge_cursors: list[str] = field(default_factory=list)
 
     @property
     def ts_range(self) -> tuple[int, int] | None:
@@ -103,7 +106,9 @@ def pages_from_doc(doc: Any, source: str) -> list[Page]:
         conn = obj.get("slide_messages")
         if not isinstance(conn, dict) or not isinstance(conn.get("edges"), list):
             continue
-        nodes = [e["node"] for e in conn["edges"] if isinstance(e, dict) and isinstance(e.get("node"), dict)]
+        edges = [e for e in conn["edges"] if isinstance(e, dict)]
+        nodes = [e["node"] for e in edges if isinstance(e.get("node"), dict)]
+        cursors = [e["cursor"] for e in edges if isinstance(e.get("cursor"), str)]
         claimed.update(id(n) for n in nodes)
         pages.append(
             Page(
@@ -112,6 +117,7 @@ def pages_from_doc(doc: Any, source: str) -> list[Page]:
                 page_info=conn.get("page_info"),
                 thread_id=obj.get("id"),
                 request_cursor=request_cursor(doc),
+                edge_cursors=cursors,
             )
         )
 

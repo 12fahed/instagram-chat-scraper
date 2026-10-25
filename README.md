@@ -72,14 +72,22 @@ python -m src.analyze build  data/sample --me <your-username> --media
 parser did not recognise — run it after a real capture so new message types show
 up instead of silently rendering as "Unsupported".
 
-`build` writes `data/out/chat.json` (normalised) and `data/out/chat.html`
-(self-contained: day dividers, reply quotes that jump to the quoted message,
-reaction chips, share cards, search, dark mode, system-line toggle).
+`build` writes `data/out/chat.json` (normalised) plus the HTML (day dividers, reply
+quotes that jump to the quoted message, reaction chips, share cards, photo/video
+bubbles, search, dark mode, system-line toggle).
 
 `--me` accepts a username, igid or sender id and decides which side is "yours".
+
+`--split` is `auto` by default: over 3,000 messages the archive becomes one page
+per year (`chat-2021.html`, …) with `chat.html` as an index, because a single page
+for a multi-year thread is slow to open and to search. Reply quotes that cross a
+year boundary link into the other file and land on the quoted message. Force it
+either way with `--split year` / `--split none`.
+
 `--media` downloads preview images and avatars into `data/out/media/` and rewrites
-the page to use them — worth doing, because the CDN URLs in a capture are signed
-and expire within days.
+the pages to use them — worth doing, because the CDN URLs in a capture are signed
+and expire within days. Video originals are skipped unless you add `--media-video`.
+Anything that fails leaves a visible placeholder rather than vanishing.
 
 ## Response shape (from `data/sample`, 2 scrolls / 40 messages)
 
@@ -106,7 +114,7 @@ Per node, the fields that matter:
 | `msg_reactions[]` | same reactors, ids only; redundant with `reactions` |
 | `mentions[]`, `slide_edit_history[]`, `is_pinned`, `igd_is_forwarded` | empty in the sample, carried through anyway |
 
-`content.__typename` splits three ways:
+`content.__typename` splits several ways:
 
 - `SlideMessageText` — plain text in `content.text_body`.
 - `SlideMessageAdminText` — system line, text in `content.text_fragments[].plaintext`.
@@ -122,10 +130,35 @@ Per node, the fields that matter:
     sits in `title_text`, link in `target_url`) or the `"Message expired"` tombstone
     (empty `target_url`).
   - `SlideMessagePlaceholderXMA` — `"Message unavailable"`, deleted or privacy-hidden.
+  - `SlideMessageExpiredPlaceholderXMA` — an expired story share.
+- `SlideMessageImageContent` / `SlideMessageRavenImageContent` /
+  `SlideMessageRavenVideoContent` / `SlideMessageAnimatedMediaContent` — media sent
+  straight into the chat rather than shared. "Raven" is Meta's name for
+  disappearing / view-once media. All four expose the same fields
+  (`preview_cdn_url`, `attachment_cdn_url`, `preview_width/height`,
+  `attachment_fbid`); they differ only in `attachment` vs `attachments[]` vs
+  `animated_media[]`, and animated media uses `attachment_webp_url` /
+  `attachment_mp4_url` instead.
+- `content: null` with `content_type: "NOT_SET"` — an empty shell, no
+  `tombstone_reason`. Rendered as "Message removed" rather than dropped.
+
+Two traps in the media urls:
+
+- IG encodes the render size as `_s<W>x<H>` in the path. A view-once photo that has
+  already been consumed comes back as a **12×12 blur with no larger url anywhere** —
+  there is no image left. Those attachments are dropped so the message falls through
+  to the "unavailable" tombstone instead of rendering a smudge.
+- `*_cdn_fallback_url` is a bare path into IG's `media_fallback` endpoint, not a
+  usable URL, so it is ignored.
 
 Sample breakdown: 15 text, 10 shares, 9 unavailable/expired, 5 system lines,
 1 story share; 11 replies and 6 reacted messages — all 11 replies resolved to a
 message inside the same two scrolls.
+
+A participant can come back **unhydrated**: blank `name`, `user_dict: null`, only an
+`igid` — a deleted account or someone who left. They are a real sender, so their
+messages are kept, but they do not count toward "is this a group" (which decides
+whether every incoming bubble gets a name label) and labels fall back to the igid.
 
 ## Capture notes
 

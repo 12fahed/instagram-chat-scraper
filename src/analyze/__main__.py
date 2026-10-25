@@ -43,6 +43,11 @@ def main(argv: list[str] | None = None) -> None:
             sp.add_argument("--title", default="Instagram chat", help="page title")
             sp.add_argument("--media", action="store_true",
                             help="download IG CDN images into out/media and link locally")
+            sp.add_argument("--media-video", action="store_true",
+                            help="with --media, also download video originals (large)")
+            sp.add_argument("--split", choices=("auto", "year", "none"), default="auto",
+                            help="split the archive into one page per year "
+                                 f"(auto: when over {render.SPLIT_THRESHOLD:,} messages)")
 
     args = ap.parse_args(argv)
     files = load.collect_files(args.input)
@@ -61,24 +66,36 @@ def main(argv: list[str] | None = None) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     if args.media:
         print("downloading media…")
-        print("  ", parse_stats := media_stats(chat, args.out))
-    html_path = args.out / "chat.html"
+        print("  ", media_stats(chat, args.out, args.media_video))
+
     json_path = args.out / "chat.json"
     json_path.write_text(
         json.dumps({"thread_id": chat["thread_id"], "me": me, "people": chat["people"],
                     "messages": chat["messages"]}, ensure_ascii=False, indent=1),
         encoding="utf-8",
     )
-    html_path.write_text(render.render(chat, me, args.title), encoding="utf-8")
-    replies = sum(1 for m in chat["messages"] if m["reply"])
-    reacts = sum(1 for m in chat["messages"] if m["reactions"])
-    print(f"{len(chat['messages'])} messages ({replies} replies, {reacts} with reactions)")
-    print(f"written: {json_path}\n         {html_path}")
+    pages = render.render_all(chat, me, args.title, args.split)
+    for name, page in pages.items():
+        (args.out / name).write_text(page, encoding="utf-8")
+
+    msgs = chat["messages"]
+    replies = sum(1 for m in msgs if m["reply"])
+    reacts = sum(1 for m in msgs if m["reactions"])
+    media = sum(len(m.get("media") or []) for m in msgs)
+    removed = sum(1 for m in msgs if m["kind"] == "removed")
+    unknown = sum(1 for m in msgs if m["kind"] == "unknown")
+    print(f"{len(msgs):,} messages ({replies:,} replies, {reacts:,} reacted, "
+          f"{media:,} attachments, {removed} removed)")
+    if unknown:
+        print(f"WARNING: {unknown} messages still render as Unsupported — run `report`")
+    print(f"written: {json_path}")
+    for name in sorted(pages):
+        print(f"         {args.out / name}")
 
 
-def media_stats(chat: dict, out: Path) -> dict:
+def media_stats(chat: dict, out: Path, videos: bool = False) -> dict:
     from .media import mirror
-    return mirror(chat, out)
+    return mirror(chat, out, videos=videos)
 
 
 if __name__ == "__main__":
