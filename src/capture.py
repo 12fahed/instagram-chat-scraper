@@ -15,8 +15,13 @@ How a run goes:
 3. Now open the chat you want. The very first thread request — the one that paints
    the bottom of the conversation — is recorded too, so the archive has its
    starting point.
-4. As soon as that first page of messages lands, the script starts scrolling up and
-   keeps recording until the thread runs out or nothing new loads for a while.
+4. As soon as that first page of messages lands, the script keeps the conversation
+   coming until the thread runs out. By default it does that by replaying the
+   thread's own GraphQL query with the next cursor, which uses no extra memory;
+   --scroll drives the UI instead, which is how the page itself does it but fills
+   the renderer until it dies. Images and video are never loaded (--images allows
+   them): the archive takes media URLs from the JSON, and `analyze --media`
+   downloads them afterwards.
 
 The browser is never closed behind your back. Whatever happens - the top of the
 thread, an idle stall, a renderer crash, an unexpected error - the script says what
@@ -31,6 +36,7 @@ Output goes to data/captures/, which is gitignored — keep it that way.
 import asyncio
 import json
 import random
+import argparse
 import os
 import re
 import signal
@@ -39,7 +45,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from playwright.async_api import Error as PlaywrightError, async_playwright
 
@@ -52,6 +58,15 @@ URL_PATTERNS = ("/graphql", "/api/graphql", "/api/v1/direct_v2")
 
 # Form fields in the request that are auth tokens: never written to disk.
 SECRET_FIELDS = {"fb_dtsg", "lsd", "jazoest", "__hs", "__hsi", "__rev", "__s", "__dyn", "__csr"}
+
+# Instagram's DM pane does not virtualise: every message you scroll past stays in
+# the DOM with its images decoded, and the renderer dies somewhere around 20k
+# messages. We never read media from the page - the archive takes every URL from
+# the JSON - so refusing to load it costs nothing and buys a lot of headroom.
+BLOCKED_RESOURCES = {"image", "media", "font"}
+
+API_DELAY = 1.2                 # seconds between paged API requests
+CURSOR_VARS = ("after", "cursor", "before")
 
 IDLE_ROUNDS_TO_STOP = 10        # stop after this many scrolls with no new data
 MAX_SCROLL_FAILURES = 5         # consecutive failed scrolls before giving up
@@ -74,7 +89,14 @@ state = {
     "pause": False,             # Ctrl+C asked us to pause at the end of this round
     "quit": False,              # Ctrl+C again: stop altogether
     "prompt": None,             # the future a waiting prompt is parked on, if any
-    "scrolling": False,         # only pause/stop the scroll while there is one
+    "scrolling": False,         # only pause/stop while a capture loop is running
+    "mode": "api",              # "api" (paging the query) or "scroll" (driving the UI)
+    # The live thread request, kept to replay with a different cursor. It carries
+    # auth tokens, so it lives in memory for the length of the run and is never
+    # written to disk or printed.
+    "template": None,
+    "next_cursor": None,        # end_cursor of the furthest-back page seen
+    "blocked": 0,               # media requests refused
 }
 
 
@@ -153,10 +175,11 @@ def install_pause_handler() -> bool:
             return                       # already stopping; do not confuse the user
         if state["pause"]:
             state["quit"] = True
-            print("\n  Ctrl+C again — stopping after this scroll.")
+            print("\n  Ctrl+C again — stopping.")
         else:
             state["pause"] = True
-            print("\n  Ctrl+C — pausing after this scroll (again to stop).")
+            unit = "request" if state["mode"] == "api" else "scroll"
+            print(f"\n  Ctrl+C — pausing after this {unit} (again to stop).")
 
     try:
         asyncio.get_running_loop().add_signal_handler(signal.SIGINT, on_sigint)
@@ -242,10 +265,90 @@ def note_thread(chunks) -> int:
                 state["oldest_ms"] = min(ts, state["oldest_ms"] or ts)
                 state["newest_ms"] = max(ts, state["newest_ms"] or ts)
         page_info = conn.get("page_info") or {}
-        # Edges come back newest-first, so the "next" page is the older one.
+        # Edges come back newest-first, so the "next" page is the older one and
+        # end_cursor is where to continue from.
+        if page_info.get("end_cursor"):
+            state["next_cursor"] = page_info["end_cursor"]
         if page_info.get("has_next_page") is False:
             state["exhausted"] = True
     return added
+
+
+# fetch() refuses to let a page set these; the browser supplies them itself.
+FETCH_FORBIDDEN_HEADERS = {
+    "host", "connection", "content-length", "cookie", "accept-encoding",
+    "origin", "referer", "user-agent", "sec-fetch-mode", "sec-fetch-site",
+    "sec-fetch-dest", "te", "transfer-encoding", "upgrade", "keep-alive",
+}
+
+
+def body_with_cursor(post_data: str, cursor: str) -> str | None:
+    """Swap the pagination cursor in a captured request body, change nothing else.
+
+    The body is form-encoded with one field holding the GraphQL variables as JSON;
+    every other field (doc_id, the auth tokens, the dozens of __ fields) is copied
+    through byte for byte, so the replay is the request Instagram's own page makes.
+    """
+    pairs = parse_qsl(post_data, keep_blank_values=True)
+    if not any(k == "variables" for k, _ in pairs):
+        return None
+    out, ok = [], False
+    for key, value in pairs:
+        if key == "variables":
+            try:
+                variables = json.loads(value)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(variables, dict):
+                return None
+            name = next((v for v in CURSOR_VARS if v in variables), CURSOR_VARS[0])
+            variables[name] = cursor
+            value = json.dumps(variables, separators=(",", ":"))
+            ok = True
+        out.append((key, value))
+    return urlencode(out) if ok else None
+
+
+# Runs inside the page, so the request carries the session exactly as Instagram's
+# own code would, and Playwright's response event fires for it - which means
+# on_response() saves the body with no extra work. Only pagination metadata comes
+# back across the bridge; the messages themselves never pass through Python here.
+FETCH_JS = r"""
+async ([url, body, headers]) => {
+  let res;
+  try {
+    res = await fetch(url, { method: 'POST', body, headers, credentials: 'include' });
+  } catch (e) {
+    return { ok: false, status: 0, error: String(e) };
+  }
+  const text = await res.text();
+  const info = { ok: res.ok, status: res.status, bytes: text.length,
+                 count: 0, end_cursor: null, has_next_page: null };
+  if (!res.ok) { info.error = text.slice(0, 200); return info; }
+  let data;
+  try {
+    data = JSON.parse(text.replace(/^for \(;;\);/, ''));
+  } catch (e) {
+    info.error = 'unparseable body: ' + text.slice(0, 120);
+    return info;
+  }
+  const stack = [data];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object') continue;
+    const conn = node.slide_messages;
+    if (conn && Array.isArray(conn.edges)) {
+      info.count += conn.edges.length;
+      if (conn.page_info) {
+        if (conn.page_info.end_cursor) info.end_cursor = conn.page_info.end_cursor;
+        info.has_next_page = conn.page_info.has_next_page;
+      }
+    }
+    for (const v of Object.values(node)) stack.push(v);
+  }
+  return info;
+}
+"""
 
 
 def next_seq() -> int:
@@ -284,9 +387,34 @@ async def on_response(resp):
         record["raw"] = body  # keep it so nothing is lost
     path = OUT / f"{state['count']:05d}_{name}.json"
     path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    pages_before = state["thread_pages"]
     added = note_thread(chunks)
+    if state["thread_pages"] > pages_before and state["template"] is None:
+        await remember_template(resp)
     extra = f", +{added} messages" if added else ""
     print(f"  saved {path.name} ({len(body):,} bytes{extra})")
+
+
+async def remember_template(resp):
+    """Keep one genuine thread request so it can be replayed with a new cursor.
+
+    Memory only. The body holds fb_dtsg and friends, which is exactly why
+    clean_request() strips them before anything is written to disk.
+    """
+    post_data = resp.request.post_data
+    if not post_data:
+        return
+    try:
+        headers = await resp.request.all_headers()
+    except Exception:
+        headers = {}
+    state["template"] = {
+        "url": resp.url,
+        "post_data": post_data,
+        "headers": {k: v for k, v in headers.items()
+                    if not k.startswith(":") and k.lower() not in FETCH_FORBIDDEN_HEADERS},
+    }
+    print("  (captured the thread query — API paging is available)")
 
 
 def on_websocket(ws):
@@ -387,6 +515,7 @@ async def scroll_loop(page) -> dict:
     print("\nScrolling. A dashed blue outline marks the pane being scrolled.")
     print("If the wrong pane is outlined, click inside the chat messages and restart.\n")
     last_height, idle, quiet_after_end, rounds, failures = None, 0, 0, 0, 0
+    state["mode"] = "scroll"
     state["scrolling"] = True
     try:
         while idle < IDLE_ROUNDS_TO_STOP:
@@ -439,9 +568,95 @@ async def scroll_loop(page) -> dict:
         state["scrolling"] = False
 
 
+async def api_loop(page) -> dict:
+    """Page the thread query directly instead of scrolling the UI.
+
+    Each request chains off the previous response's end_cursor, so nothing
+    accumulates in the DOM and there is no memory ceiling to hit. The responses
+    are saved by on_response() exactly as the scrolled ones are.
+    """
+    template = state["template"]
+    if not template:
+        return {"reason": "no_template", "detail": "never saw a thread request", "rounds": 0}
+
+    state["mode"] = "api"
+    cursor, rounds = state["next_cursor"], 0
+    print("\nPaging the thread query directly (no scrolling, constant memory).")
+    print(f"One request every ~{API_DELAY}s.\n")
+    state["scrolling"] = True
+    try:
+        while True:
+            if state["quit"]:
+                return {"reason": "interrupted", "detail": None, "rounds": rounds}
+            if state["pause"]:
+                return {"reason": "paused", "detail": None, "rounds": rounds}
+            if state["crashed"] or page.is_closed():
+                return {"reason": "page_gone",
+                        "detail": "the renderer crashed" if state["crashed"] else "the page was closed",
+                        "rounds": rounds}
+            if not cursor:
+                return {"reason": "reached_top", "detail": "no cursor to follow", "rounds": rounds}
+
+            body = body_with_cursor(template["post_data"], cursor)
+            if body is None:
+                return {"reason": "no_template",
+                        "detail": "could not place a cursor in the request body", "rounds": rounds}
+
+            rounds += 1
+            try:
+                info = await page.evaluate(
+                    FETCH_JS, [template["url"], body, template["headers"]]
+                )
+            except (PlaywrightError, asyncio.TimeoutError) as exc:
+                first_line = str(exc).strip().splitlines()[0][:160]
+                if _page_gone(exc, page):
+                    return {"reason": "page_gone", "detail": first_line, "rounds": rounds}
+                return {"reason": "api_failed", "detail": first_line, "rounds": rounds}
+
+            if not info.get("ok"):
+                return {"reason": "api_rejected",
+                        "detail": f"HTTP {info.get('status')} — {info.get('error', '')[:140]}",
+                        "rounds": rounds}
+            if info.get("error"):
+                return {"reason": "api_rejected", "detail": info["error"][:160], "rounds": rounds}
+            if not info.get("count"):
+                return {"reason": "reached_top", "detail": "a page came back empty", "rounds": rounds}
+
+            print(f"page {rounds:>4}: +{info['count']} messages  "
+                  f"total={len(state['message_ids'])}  oldest={when(state['oldest_ms'])}")
+
+            if info.get("has_next_page") is False:
+                state["exhausted"] = True
+                return {"reason": "reached_top", "detail": None, "rounds": rounds}
+            if not info.get("end_cursor"):
+                return {"reason": "reached_top", "detail": "no further cursor", "rounds": rounds}
+
+            cursor = info["end_cursor"]
+            await asyncio.sleep(random.uniform(API_DELAY * 0.8, API_DELAY * 1.4))
+    finally:
+        state["scrolling"] = False
+
+
+async def block_media(route, request):
+    """Refuse images/video/fonts: the renderer keeps every one of them alive."""
+    if request.resource_type in BLOCKED_RESOURCES:
+        state["blocked"] += 1
+        try:
+            await route.abort()
+        except Exception:
+            pass
+        return
+    try:
+        await route.continue_()
+    except Exception:
+        pass
+
+
 def summary():
     print(f"\n{state['count']} responses in {OUT}")
     print(f"{len(state['message_ids'])} unique messages across {state['thread_pages']} thread pages")
+    if state["blocked"]:
+        print(f"{state['blocked']} media requests blocked (they are downloaded later by --media)")
     if state["message_ids"]:
         print(f"range: {when(state['oldest_ms'])}  ..  {when(state['newest_ms'])}")
 
@@ -454,7 +669,19 @@ def report_outcome(outcome: dict):
         print("PAUSED. Recording is OFF — nothing is being written while paused.")
         print(f"Captured so far: {len(state['message_ids'])} messages back to "
               f"{when(state['oldest_ms'])}")
-        print("The chat pane keeps its position, so resuming carries on from here.")
+        if state["mode"] == "api":
+            print("Resuming carries on from the last cursor Instagram handed out.")
+        else:
+            print("The chat pane keeps its position, so resuming carries on from here.")
+    elif reason == "api_rejected":
+        print("INSTAGRAM REFUSED THE REPLAYED REQUEST.")
+        print(f"It said: {detail}")
+        print("\nThe captured request may have aged out. Re-run with --scroll to go")
+        print("back to driving the UI, which is slower but always matches the page.")
+    elif reason in ("api_failed", "no_template"):
+        print("API PAGING COULD NOT CONTINUE.")
+        print(f"Reason: {detail}")
+        print("\nRe-run with --scroll to fall back to scrolling the UI.")
     elif reason == "reached_top":
         print("REACHED THE TOP. Instagram reports no older messages in this thread.")
         print(f"Oldest message captured: {when(state['oldest_ms'])}")
@@ -496,7 +723,7 @@ async def hold_open(ctx, page, outcome: dict) -> bool:
     elif outcome["reason"] == "paused":
         print("\nThe browser is yours — scroll, open a reply, let things load.")
         print("Nothing is recorded until you resume, so you can move around freely.")
-        prompt = "Type r then Enter to resume recording and scrolling, or just Enter to stop... "
+        prompt = "Type r then Enter to resume recording, or just Enter to stop... "
     elif outcome["reason"] != "reached_top":
         print("\nThe browser is still open — go look at it if you want.")
         print("Scrolling can carry on from exactly where the chat pane is now,")
@@ -523,7 +750,22 @@ def watch_for_crash(page):
     page.on("crash", crashed)
 
 
-async def main():
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Capture an Instagram DM thread.")
+    ap.add_argument("--scroll", action="store_true",
+                    help="drive the UI by scrolling instead of paging the query "
+                         "(slower, and the renderer eventually runs out of memory)")
+    ap.add_argument("--images", action="store_true",
+                    help="let the page load images and video (uses far more memory)")
+    ap.add_argument("--delay", type=float, default=API_DELAY,
+                    help=f"seconds between paged requests (default {API_DELAY})")
+    return ap.parse_args(argv)
+
+
+async def main(args=None):
+    args = args or parse_args()
+    global API_DELAY
+    API_DELAY = args.delay
     OUT.mkdir(parents=True, exist_ok=True)
     state["count"] = next_seq()
     if state["count"]:
@@ -538,6 +780,8 @@ async def main():
             # chat pane; a small /dev/shm is a common way for that to end badly.
             args=["--disable-dev-shm-usage"],
         )
+        if not args.images:
+            await ctx.route("**/*", block_media)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         watch(page)
         watch_for_crash(page)
@@ -556,11 +800,16 @@ async def main():
                                 "detail": "closed before a chat was opened"})
                 raise SystemExit(1)
             if install_pause_handler():
-                print("Ctrl+C pauses the scroll (Ctrl+C twice stops).")
+                print("Ctrl+C pauses (Ctrl+C twice stops).")
+            use_api = not args.scroll
+            if use_api and not state["template"]:
+                print("\nNo thread request was captured, so API paging is not possible.")
+                print("Falling back to scrolling the UI.")
+                use_api = False
             while True:
                 state["pause"] = state["quit"] = False
                 try:
-                    outcome = await scroll_loop(page)
+                    outcome = await (api_loop(page) if use_api else scroll_loop(page))
                 except KeyboardInterrupt:
                     outcome = {"reason": "interrupted", "detail": None}
                 except Exception:

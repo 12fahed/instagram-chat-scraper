@@ -47,18 +47,38 @@ python src/capture.py
 Recording is off until you press Enter, and you press it **before** opening the
 chat — so the first thread request, the bottom of the conversation, is recorded
 too. After that the script waits for the chat to actually open (it watches for the
-first response carrying messages), settles, then scrolls on its own.
+first response carrying messages), settles, then keeps going on its own.
 
-It stops when Instagram reports `has_next_page: false` and two more scrolls stay
-quiet, or after 10 scrolls with nothing new — and tells you which of the two
-happened, so you know whether you really reached the top. Re-running continues the
-file numbering instead of overwriting the previous run.
+By default it does **not** scroll. Once the thread is open it has a genuine
+`IGDMessageListOffMsysQuery` request in hand, so it replays that request from
+inside the page with the next `end_cursor`, over and over, until
+`has_next_page: false`. Nothing accumulates in the DOM, so there is no memory
+ceiling, each page chains exactly off the last, and it runs far faster than
+scrolling. The replayed request is the page's own — same body, same headers, same
+session — with only the cursor changed; it is held in memory for the run and never
+written to disk, which is why `clean_request()` strips the auth fields from
+everything that *is* saved.
 
-**Ctrl+C pauses rather than quits.** The first Ctrl+C stops scrolling at the end of
-the current round and **turns recording off**, so you can scroll, open a reply or
-go look at something else without any of it landing in `data/captures`. Then type
-`r` to resume (recording comes back on and the scroll continues from where the pane
-is), or just Enter to stop. A second Ctrl+C stops the run — in-loop if it lands
+`--scroll` goes back to driving the UI. That is what the page itself does, but
+Instagram's DM pane does not virtualise: every message you scroll past stays in the
+DOM with its images decoded, and the renderer dies at roughly 19–23k messages
+(observed twice, at 931 and 1,171 pages). It stops when Instagram reports
+`has_next_page: false` and two more scrolls stay quiet, or after 10 scrolls with
+nothing new — and says which, so you know whether you really reached the top.
+
+Images, video and fonts are **blocked at the network layer** in both modes. The
+archive takes every media URL from the JSON, never from the rendered page, so
+refusing to load them costs nothing and removes the biggest source of memory
+pressure; `--images` turns the blocking off. The files themselves are fetched later
+by `analyze build --media`.
+
+Re-running continues the file numbering instead of overwriting the previous run.
+
+**Ctrl+C pauses rather than quits.** The first Ctrl+C stops at the end of the
+current round and **turns recording off**, so you can scroll, open a reply or go
+look at something else without any of it landing in `data/captures`. Then type `r`
+to resume — recording comes back on and it continues from the last cursor (or,
+in `--scroll` mode, from wherever the pane now sits) — or just Enter to stop. A second Ctrl+C stops the run — in-loop if it lands
 before the round ends, otherwise by answering the pause prompt; either way it stops.
 
 **The browser is never closed behind your back.** Whatever ends the run — the top of

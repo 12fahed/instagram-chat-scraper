@@ -1,0 +1,2 @@
+- python desktop app
+- choose viewpoint (user1 or user2) after captures to view chats in that view
