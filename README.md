@@ -1,10 +1,29 @@
-# scrape-instagram
+# instagram-chat-scrapper
 
 Rebuild a complete, readable archive of one Instagram direct-message thread from
 the network responses Instagram's own web app makes — because the official data
 export throws away most of what makes a conversation legible.
 
 Everything stays on your machine.
+
+## Contents
+
+- [Why this exists](#why-this-exists)
+- [The difference, side by side](#the-difference-side-by-side)
+- [What you get](#what-you-get)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Usage](#usage)
+  - [1. Capture the thread](#1-capture-the-thread)
+  - [2. Check what you captured](#2-check-what-you-captured)
+  - [3. Build the reading view](#3-build-the-reading-view)
+  - [4. Download the media](#4-download-the-media-optional-slow)
+- [Commands and flags](#commands-and-flags)
+- [How this was tested](#how-this-was-tested)
+- [Known limitations](#known-limitations)
+- [Privacy](#privacy)
+- [Repo layout](#repo-layout)
+- [Developer documentation](docs/DEVELOPERS.md)
 
 ## Why this exists
 
@@ -27,6 +46,22 @@ cards, reactions with their senders, and the message type.
 So rather than fight the export: drive the real web app, record what it receives,
 and rebuild the thread offline from that.
 
+## The difference, side by side
+
+The same conversation, as the official export renders it and as this rebuilds it:
+
+| Instagram's official export | This archive |
+| :---: | :---: |
+| ![The same conversation as Instagram's "Download your information" export renders it](docs/images/official-export.png) | ![The same conversation rebuilt by this project](docs/images/this-archive.png) |
+| replies detached, shares reduced to links | replies quoted inline, shares as cards |
+
+<!--
+  Screenshots go in docs/images/ :
+    official-export.png - a chat opened from Instagram's "Download your information" export
+    this-archive.png    - the same chat opened from data/out/chat.html
+  Pick a stretch with a few threaded replies and a shared post, so the difference is obvious.
+-->
+
 ## What you get
 
 - `data/captures/` — every raw response, exactly as received, written as it arrives
@@ -39,7 +74,20 @@ and rebuild the thread offline from that.
 
 All of `data/` is gitignored.
 
-## How it works, in short
+## How it works
+
+```mermaid
+flowchart LR
+    IG[("Instagram")]
+    CH["Chromium<br/>your logged-in session"]
+    CAP[("data/captures/<br/>raw responses")]
+    AN["src.analyze<br/>offline"]
+    OUT[("data/out/<br/>chat.json · chat*.html · report.txt")]
+
+    IG -->|"serves the query the<br/>web app itself makes"| CH
+    CH -->|"every response,<br/>saved as it arrives"| CAP
+    CAP --> AN --> OUT
+```
 
 1. **Capture** opens a real Chromium with a persistent profile, so you log in once.
    Nothing is recorded until you press Enter.
@@ -50,6 +98,34 @@ All of `data/` is gitignored.
    says there is nothing older. Each response is saved the moment it lands.
 4. **Analyse** reads those files offline, normalises every message shape it knows,
    and writes the JSON and the HTML.
+
+A run looks like this:
+
+```mermaid
+sequenceDiagram
+    actor You
+    participant Term as terminal
+    participant CH as Chromium
+    participant IG as Instagram
+
+    You->>Term: python -m src.capture
+    Term->>CH: open on the DM inbox
+    You->>Term: press Enter
+    Note over Term: recording armed
+    You->>CH: open the conversation
+    CH->>IG: thread query
+    IG-->>CH: newest 20 messages
+    Note over Term: saved · request kept as template
+
+    loop until has_next_page is false
+        Term->>CH: replay the query with the next cursor
+        CH->>IG: same request, new cursor
+        IG-->>CH: 20 older messages
+        Note over Term: saved to data/captures/
+    end
+
+    Term-->>You: reached the top of the thread
+```
 
 Nothing is sent anywhere. The only outbound traffic is to Instagram itself, plus
 the optional media download, which goes to Instagram's own CDN.

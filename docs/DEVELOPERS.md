@@ -1,27 +1,52 @@
-# How it works
+# instagram-chat-scrapper — how it works
 
 Technical notes for anyone changing this. For what it is and how to run it, see
 the [README](../README.md).
 
 Participants are referred to as **userA** and **userB** throughout.
 
+## Contents
+
+- [1. The two halves](#1-the-two-halves)
+- [2. What Instagram actually returns](#2-what-instagram-actually-returns)
+- [3. Capture](#3-capture)
+- [4. Analyse](#4-analyse)
+- [5. Adding a new message type](#5-adding-a-new-message-type)
+- [6. Pitfalls worth knowing](#6-pitfalls-worth-knowing)
+- [7. Testing](#7-testing)
+
 ---
 
 ## 1. The two halves
 
-```
-          live web app                           offline
-  ┌────────────────────────────┐      ┌──────────────────────────────┐
-  │  src/capture               │      │  src/analyze                 │
-  │                            │      │                              │
-  │  Chromium (your session)   │      │  load    find message nodes  │
-  │    │                       │      │  parse   normalise them      │
-  │    ├─ response listener ───┼──┐   │  schema  report + unknowns   │
-  │    └─ paging loop          │  │   │  render  markup for a page   │
-  │                            │  │   │  pages   split + index       │
-  └────────────────────────────┘  │   │  media   mirror CDN files    │
-                                  ▼   └──────────────────────────────┘
-                        data/captures/*.json ──────────┘
+```mermaid
+flowchart TB
+    subgraph live["src/capture — live browser session"]
+        direction TB
+        CH["Chromium<br/>your logged-in session"]
+        REC["response listener<br/>recording.py"]
+        LOOP["paging.py / scrolling.py"]
+        CH --> REC
+        LOOP --> CH
+    end
+
+    FILES[("data/captures/*.json")]
+
+    subgraph offline["src/analyze — offline"]
+        direction TB
+        LOAD["load<br/>find message nodes"]
+        PARSE["parse<br/>normalise them"]
+        SCHEMA["schema<br/>report + unknowns"]
+        RENDER["render / pages<br/>build the HTML"]
+        MEDIA["media<br/>mirror CDN files"]
+        LOAD --> PARSE
+        PARSE --> SCHEMA
+        PARSE --> RENDER
+        RENDER --> MEDIA
+    end
+
+    REC --> FILES
+    FILES --> LOAD
 ```
 
 The halves share nothing but the files in `data/captures/`. Capture never
@@ -192,6 +217,27 @@ Both loops return `{"reason", "detail", "rounds"}` instead of raising:
 step. The browser is deliberately never closed on the way out — the run holds at a
 prompt so the page can be inspected.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Waiting: script starts
+    Waiting --> Armed: you press Enter
+    Armed --> Capturing: first thread response<br/>template captured
+
+    Capturing --> Capturing: follow end_cursor
+
+    Capturing --> Paused: Ctrl+C
+    Paused --> Capturing: r
+    Paused --> [*]: Enter
+
+    Capturing --> ReachedTop: has_next_page false
+    Capturing --> PageGone: tab closed or renderer died
+    Capturing --> Rejected: request refused
+
+    ReachedTop --> [*]
+    Rejected --> [*]: re-run with --scroll
+    PageGone --> [*]: re-run, resume from the saved cursor
+```
+
 ### Pause and resume
 
 Ctrl+C pauses rather than quits. Two details are load-bearing:
@@ -287,6 +333,26 @@ called. All of them use `preview_cdn_url`, `attachment_cdn_url`, `preview_width`
 
 `*_cdn_fallback_url` is a bare path into Instagram's `media_fallback` endpoint,
 not a usable URL, and is ignored.
+
+```mermaid
+flowchart TD
+    NODE["message node"] --> HAS{"content present?"}
+    HAS -->|"null"| REMOVED["removed<br/>an empty shell"]
+    HAS -->|"yes"| TYPE{"content.__typename"}
+
+    TYPE -->|"SlideMessageText"| TEXT["text"]
+    TYPE -->|"SlideMessageAdminText"| ADMIN["admin<br/>system line"]
+    TYPE -->|"the media families"| MEDIA{"any usable<br/>attachment?"}
+    TYPE -->|"SlideMessageXMAContent"| XMA{"xma.__typename"}
+
+    MEDIA -->|"yes"| MOK["media<br/>image · video · audio · animation"]
+    MEDIA -->|"no"| TOMB["unavailable<br/>tombstone"]
+
+    XMA -->|"PortraitXMA"| SHARE["share / story_share"]
+    XMA -->|"StandardXMA"| SHARE
+    XMA -->|"PlaceholderXMA"| TOMB
+    XMA -->|"ExpiredPlaceholderXMA"| TOMB
+```
 
 `xma.__typename` dispatches the share cards: `SlideMessagePortraitXMA` (a post,
 reel or story with a preview image), `SlideMessageStandardXMA` (a share with no
