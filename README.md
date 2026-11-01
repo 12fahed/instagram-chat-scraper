@@ -6,8 +6,12 @@ export throws away most of what makes a conversation legible.
 
 Everything stays on your machine.
 
+> **Early project, and it reads an API that is not meant for this.**
+> Please read [Status and warning](#status-and-warning) before relying on it.
+
 ## Contents
 
+- [Status and warning](#status-and-warning)
 - [Why this exists](#why-this-exists)
 - [The difference, side by side](#the-difference-side-by-side)
 - [What you get](#what-you-get)
@@ -23,7 +27,36 @@ Everything stays on your machine.
 - [Known limitations](#known-limitations)
 - [Privacy](#privacy)
 - [Repo layout](#repo-layout)
+- [License](#license)
 - [Developer documentation](docs/DEVELOPERS.md)
+- [Contributing](CONTRIBUTING.md)
+
+## Status and warning
+
+**This exists so conversations are not lost.** A long thread is worth something —
+and Instagram gives you no real way to keep it. Telegram will hand you a readable
+export of a chat; Instagram hands you a folder of disconnected rows with the
+replies, shares and context stripped out. That gap is the only reason this was
+written, and the reason it is open source rather than a private script.
+
+**It is in an early phase, so expect it to break.** The capture flow has been run
+end to end on real conversations and works, but the surface is wide: message
+types nobody has hit yet, threads shaped differently from the ones tested,
+accounts in other states. If something breaks and you work out why, a fix PR is
+genuinely welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**Instagram can change the endpoint or the response shape at any time.** This
+reads an internal, unversioned API by replaying the web app's own request. There
+is no contract behind it and no deprecation notice when it changes. When that
+happens, capture may stop early or `analyze report` will list message shapes it
+no longer recognises — the tooling is built to say so loudly rather than fail
+quietly, but it will still need fixing.
+
+**Use it responsibly.** Archive conversations you are part of, on an account you
+own. A thread belongs to the other person as much as to you: they did not agree
+to being archived, so keep what you capture private, do not republish it, and be
+careful what you paste into issues or screenshots. Nothing here uploads anything
+anywhere — what happens to the archive afterwards is on you.
 
 ## Why this exists
 
@@ -317,3 +350,8 @@ data/                 gitignored
   captures/           raw responses
   out/                chat.json, chat*.html, media/, report.txt
 ```
+
+## License
+
+[MIT](LICENSE). The copyright line names the project's contributors rather than
+an individual — change it if you want your own name on it.
