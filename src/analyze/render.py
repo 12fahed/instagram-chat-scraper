@@ -46,8 +46,8 @@ header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px so
 .tools button[aria-pressed=true]{background:var(--me);border-color:var(--me);color:#fff}
 
 main{max-width:880px;margin:0 auto;padding:12px 16px 80px}
-.day{position:sticky;top:64px;z-index:2;text-align:center;background:var(--bg);
-  padding:8px 0;margin:16px 0 6px}
+.day{position:sticky;top:var(--sticky,64px);z-index:2;text-align:center;
+  background:var(--bg);padding:8px 0;margin:16px 0 6px}
 .day span{color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.3px}
 .clock{text-align:center;color:var(--muted);font-size:11px;margin:16px 0 8px}
 
@@ -125,11 +125,22 @@ mark{background:rgba(55,151,240,.35);color:inherit;border-radius:3px}
 @media (max-width:560px){
   .stack{max-width:84%}
   .tools input[type=search]{width:120px}
-  .day{top:58px}
 }
 """
 
 JS = """
+// The header and the year/month nav wrap differently at different widths, so the
+// day divider's sticky offset is measured rather than guessed.
+function setOffsets() {
+  const header = document.querySelector('header');
+  const nav = document.querySelector('.navwrap');
+  const top = header ? header.offsetHeight : 0;
+  document.documentElement.style.setProperty('--hdr', top + 'px');
+  document.documentElement.style.setProperty('--sticky', (top + (nav ? nav.offsetHeight : 0)) + 'px');
+}
+setOffsets();
+addEventListener('resize', setOffsets);
+
 const main = document.querySelector('main');
 const q = document.getElementById('q');
 const sysBtn = document.getElementById('sysBtn');
@@ -476,51 +487,102 @@ def _reactors(msg: dict, people: dict) -> str:
     return ", ".join(names)
 
 
-SPLIT_THRESHOLD = 3000   # messages above which "auto" splits the archive by year
+YEAR_THRESHOLD = 3_000       # above this, "auto" splits the archive by year
+MONTH_THRESHOLD = 20_000     # above this, by month - a year can be 80k messages
 
 NAV_CSS = """
-nav.years{position:sticky;top:64px;z-index:3;background:var(--bg);border-bottom:1px solid var(--line);
-  padding:8px 16px;display:flex;gap:6px;flex-wrap:wrap;justify-content:center}
+.navwrap{position:sticky;top:var(--hdr,64px);z-index:3;background:var(--bg);
+  border-bottom:1px solid var(--line)}
+nav.years{padding:8px 16px 0;display:flex;gap:6px;flex-wrap:wrap;justify-content:center}
+nav.months{padding:6px 16px 8px}
 nav.years a{text-decoration:none;color:var(--muted);font-size:13px;border:1px solid var(--line);
   border-radius:999px;padding:3px 11px}
+nav.months a{font-size:12px;padding:2px 9px}
 nav.years a.on{background:var(--me);border-color:var(--me);color:#fff}
-.day{top:106px}
-.index{max-width:620px;margin:0 auto;padding:24px 16px 60px}
-.index a{display:flex;align-items:baseline;gap:12px;text-decoration:none;color:inherit;
+.index{max-width:680px;margin:0 auto;padding:24px 16px 60px}
+.yearblock{border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-bottom:10px}
+.yearhead{display:flex;align-items:baseline;gap:12px;margin-bottom:10px}
+.yearhead b{font-size:19px}
+.yearhead .n{margin-left:auto;color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}
+.monthrow{display:flex;flex-wrap:wrap;gap:6px}
+.monthrow a{display:flex;align-items:baseline;gap:6px;text-decoration:none;color:inherit;
+  border:1px solid var(--line);border-radius:999px;padding:4px 11px;font-size:13px}
+.monthrow a:hover{background:var(--panel)}
+.monthrow em{font-style:normal;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.index > a{display:flex;align-items:baseline;gap:12px;text-decoration:none;color:inherit;
   border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-bottom:8px}
-.index a:hover{background:var(--panel)}
-.index b{font-size:18px;min-width:3.5em}
-.index span{color:var(--muted);font-size:13px}
+.index > a:hover{background:var(--panel)}
+.index > a b{font-size:18px;min-width:3.5em}
+.index > a span{color:var(--muted);font-size:13px}
 .index .n{margin-left:auto;font-variant-numeric:tabular-nums}
 """
 
 
-def _year_file(year: int) -> str:
-    return f"chat-{year}.html"
+def _bucket_key(msg: dict, unit: str) -> str:
+    dt = datetime.fromtimestamp((msg["ts"] or 0) / 1000)
+    return dt.strftime("%Y-%m") if unit == "month" else dt.strftime("%Y")
 
 
-def _nav(years: list[int], current: int | None) -> str:
+def _file(key: str) -> str:
+    return f"chat-{key}.html"
+
+
+def _label(key: str) -> str:
+    return datetime.strptime(key, "%Y-%m").strftime("%b") if "-" in key else key
+
+
+def _nav(keys: list[str], current: str, unit: str) -> str:
+    """Years always; the current year's months underneath when split by month."""
+    years = sorted({k[:4] for k in keys})
+    current_year = current[:4]
     links = ['<a href="chat.html">All</a>']
-    for y in years:
-        on = ' class="on"' if y == current else ""
-        links.append(f'<a href="{_year_file(y)}"{on}>{y}</a>')
-    return f'<nav class="years">{"".join(links)}</nav>'
+    for year in years:
+        # Jumping to a year means its earliest bucket when months are separate files.
+        target = _file(year if unit == "year"
+                       else min(k for k in keys if k.startswith(year)))
+        on = ' class="on"' if year == current_year else ""
+        links.append(f'<a href="{_esc(target)}"{on}>{_esc(year)}</a>')
+    rows = [f'<nav class="years">{"".join(links)}</nav>']
+    if unit == "month":
+        chips = []
+        for key in sorted(k for k in keys if k.startswith(current_year)):
+            on = ' class="on"' if key == current else ""
+            chips.append(f'<a href="{_esc(_file(key))}"{on}>{_esc(_label(key))}</a>')
+        rows.append(f'<nav class="years months">{"".join(chips)}</nav>')
+    return f'<div class="navwrap">{"".join(rows)}</div>'
 
 
-def _index(chat: dict, me: str | None, title: str, buckets: dict) -> str:
+def _index(chat: dict, me: str | None, title: str, buckets: dict, unit: str) -> str:
     people = chat["people"]
     others = sorted((p for pid, p in people.items() if pid != me),
                     key=lambda p: -p.get("messages", 0))
     head = others[0] if others else next(iter(people.values()), {})
     total = sum(len(v) for v in buckets.values())
+
     rows = []
-    for year in sorted(buckets, reverse=True):
-        msgs = buckets[year]
-        first = datetime.fromtimestamp(msgs[0]["ts"] / 1000).strftime("%d %b")
-        last = datetime.fromtimestamp(msgs[-1]["ts"] / 1000).strftime("%d %b")
-        rows.append(f'<a href="{_year_file(year)}"><b>{year}</b>'
-                    f'<span>{_esc(first)} – {_esc(last)}</span>'
-                    f'<span class="n">{len(msgs):,} messages</span></a>')
+    if unit == "month":
+        by_year: dict[str, list[str]] = {}
+        for key in sorted(buckets):
+            by_year.setdefault(key[:4], []).append(key)
+        for year in sorted(by_year, reverse=True):
+            months = by_year[year]
+            count = sum(len(buckets[k]) for k in months)
+            chips = "".join(
+                f'<a href="{_esc(_file(k))}">{_esc(_label(k))}'
+                f'<em>{len(buckets[k]):,}</em></a>' for k in months
+            )
+            rows.append(f'<div class="yearblock"><div class="yearhead"><b>{_esc(year)}</b>'
+                        f'<span class="n">{count:,} messages</span></div>'
+                        f'<div class="monthrow">{chips}</div></div>')
+    else:
+        for key in sorted(buckets, reverse=True):
+            msgs = buckets[key]
+            first = datetime.fromtimestamp(msgs[0]["ts"] / 1000).strftime("%d %b")
+            last = datetime.fromtimestamp(msgs[-1]["ts"] / 1000).strftime("%d %b")
+            rows.append(f'<a href="{_esc(_file(key))}"><b>{_esc(key)}</b>'
+                        f'<span>{_esc(first)} – {_esc(last)}</span>'
+                        f'<span class="n">{len(msgs):,} messages</span></a>')
+
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -541,27 +603,35 @@ def _index(chat: dict, me: str | None, title: str, buckets: dict) -> str:
 
 
 def render_all(chat: dict, me: str | None, title: str, split: str = "auto") -> dict[str, str]:
-    """-> {filename: html}. One file, or one per year plus an index at chat.html.
+    """-> {filename: html}. One file, or one per year/month plus an index.
 
-    Splitting keeps each page small enough to open and search; reply quotes that
-    cross a year boundary are rewritten to point at the other file's anchor.
+    Splitting keeps each page small enough to open and search. A reply quoting a
+    message in another bucket is rewritten to point at that file's anchor, so the
+    links keep working across the split.
     """
     msgs = chat["messages"]
-    want_split = split == "year" or (split == "auto" and len(msgs) > SPLIT_THRESHOLD)
-    if not want_split or not msgs:
+    if split == "auto":
+        unit = ("month" if len(msgs) > MONTH_THRESHOLD
+                else "year" if len(msgs) > YEAR_THRESHOLD else "none")
+    else:
+        unit = split
+    if unit == "none" or not msgs:
         return {"chat.html": render(chat, me, title)}
 
-    buckets: dict[int, list] = {}
+    buckets: dict[str, list] = {}
     for m in msgs:
-        buckets.setdefault(datetime.fromtimestamp((m["ts"] or 0) / 1000).year, []).append(m)
-    years = sorted(buckets)
-    locate = {m["id"]: _year_file(y) for y in years for m in buckets[y]}
+        buckets.setdefault(_bucket_key(m, unit), []).append(m)
+    keys = sorted(buckets)
+    locate = {m["id"]: _file(k) for k in keys for m in buckets[k]}
 
-    out = {"chat.html": _index(chat, me, title, buckets)}
-    for year in years:
-        name = _year_file(year)
-        page = render(chat, me, f"{title} — {year}", msgs=buckets[year],
-                      locate=locate, current=name, nav=_nav(years, year))
-        out[name] = page.replace("<style>" + CSS + "</style>",
-                                 "<style>" + CSS + NAV_CSS + "</style>")
+    out = {"chat.html": _index(chat, me, title, buckets, unit)}
+    for key in keys:
+        name = _file(key)
+        heading = (datetime.strptime(key, "%Y-%m").strftime("%B %Y")
+                   if unit == "month" else key)
+        page = render(chat, me, f"{title} — {heading}", msgs=buckets[key],
+                      locate=locate, current=name, nav=_nav(keys, key, unit))
+        page = page.replace("<style>" + CSS + "</style>",
+                            "<style>" + CSS + NAV_CSS + "</style>")
+        out[name] = page
     return out

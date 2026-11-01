@@ -30,6 +30,7 @@ MEDIA_CONTENT = {
     "SlideMessageImageContent": "image",
     "SlideMessageRavenImageContent": "image",
     "SlideMessageRavenVideoContent": "video",
+    "SlideMessageVideosContent": "video",
     "SlideMessageAnimatedMediaContent": "animation",
 }
 
@@ -76,8 +77,11 @@ def _media_items(content: dict, typename: str) -> list[dict]:
     if animated:
         raw = content.get("animated_media") or []
     else:
+        # One attachment as a dict, or a list under attachments/videos - the fields
+        # inside are identical either way.
         one = content.get("attachment")
-        raw = [one] if isinstance(one, dict) else (content.get("attachments") or [])
+        raw = ([one] if isinstance(one, dict)
+               else (content.get("attachments") or content.get("videos") or []))
 
     items = []
     for att in raw:

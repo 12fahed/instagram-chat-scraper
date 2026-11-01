@@ -45,9 +45,11 @@ def main(argv: list[str] | None = None) -> None:
                             help="download IG CDN images into out/media and link locally")
             sp.add_argument("--media-video", action="store_true",
                             help="with --media, also download video originals (large)")
-            sp.add_argument("--split", choices=("auto", "year", "none"), default="auto",
-                            help="split the archive into one page per year "
-                                 f"(auto: when over {render.SPLIT_THRESHOLD:,} messages)")
+            sp.add_argument("--split", choices=("auto", "month", "year", "none"),
+                            default="auto",
+                            help="split the archive into one page per month or year "
+                                 f"(auto: by year over {render.YEAR_THRESHOLD:,} messages, "
+                                 f"by month over {render.MONTH_THRESHOLD:,})")
 
     args = ap.parse_args(argv)
     files = load.collect_files(args.input)
