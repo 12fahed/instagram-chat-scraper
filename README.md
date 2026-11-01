@@ -353,5 +353,4 @@ data/                 gitignored
 
 ## License
 
-[MIT](LICENSE). The copyright line names the project's contributors rather than
-an individual — change it if you want your own name on it.
+[MIT](LICENSE).
