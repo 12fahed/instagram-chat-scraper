@@ -351,6 +351,63 @@ async ([url, body, headers]) => {
 """
 
 
+# Pages are fetched oldest-last, so the furthest-back cursor is in one of the
+# newest files; there is no need to parse thousands of them to find it.
+RESUME_SCAN_FILES = 40
+
+
+def find_resume_point():
+    """The furthest-back cursor already on disk, so a re-run need not start over."""
+    best = None
+    for path in reversed(sorted(OUT.glob("*.json"))[-RESUME_SCAN_FILES:]):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for obj in walk(record):
+            if not isinstance(obj, dict):
+                continue
+            conn = obj.get("slide_messages")
+            if not isinstance(conn, dict) or not isinstance(conn.get("edges"), list):
+                continue
+            page_info = conn.get("page_info") or {}
+            stamps = [
+                int(node["timestamp_ms"])
+                for edge in conn["edges"]
+                for node in [(edge or {}).get("node") or {}]
+                if str(node.get("timestamp_ms", "")).isdigit()
+            ]
+            if not page_info.get("end_cursor") or not stamps:
+                continue
+            oldest = min(stamps)
+            if best is None or oldest < best["oldest"]:
+                best = {"cursor": page_info["end_cursor"], "oldest": oldest,
+                        "file": path.name, "has_next": page_info.get("has_next_page")}
+    return best
+
+
+async def offer_resume():
+    """Pick the cursor back up where a previous run stopped."""
+    point = find_resume_point()
+    if not point:
+        return
+    if point["has_next"] is False:
+        print(f"\n{OUT} already reaches the top of the thread — nothing older to fetch.")
+        return
+    # Ignore a saved cursor that is newer than where this run already is.
+    if state["oldest_ms"] and point["oldest"] >= state["oldest_ms"]:
+        return
+    print(f"\n{OUT} already reaches back to {when(point['oldest'])} ({point['file']}).")
+    print("Continuing from there picks up exactly where the last run stopped.")
+    answer = (await ainput("Press Enter to continue from there, or type f to "
+                           "start again from the newest messages... ")).strip().lower()
+    if answer == "f":
+        print("Starting again from the newest messages.")
+        return
+    state["next_cursor"] = point["cursor"]
+    print(f"Continuing from {when(point['oldest'])}.")
+
+
 def next_seq() -> int:
     """Continue numbering after an earlier run instead of overwriting it."""
     seqs = [int(m.group(1)) for p in OUT.glob("*.json") if (m := re.match(r"(\d{5})_", p.name))]
@@ -695,8 +752,9 @@ def report_outcome(outcome: dict):
         print("On a long run this is usually Chromium running out of memory: the chat")
         print("pane holds every message you scrolled past, plus their images.")
         print(f"Playwright said: {detail}")
-        print("\nEverything captured so far is already on disk. Re-run the script to")
-        print("continue; file numbering carries on and the analyser de-duplicates.")
+        print("\nEverything captured so far is already on disk. Run the script again:")
+        print(f"it will offer to continue from {when(state['oldest_ms'])} using the saved")
+        print("cursor, so nothing above that is fetched twice.")
     elif reason == "scroll_failed":
         print(f"SCROLLING FAILED {MAX_SCROLL_FAILURES} times in a row.")
         print(f"Playwright said: {detail}")
@@ -806,6 +864,8 @@ async def main(args=None):
                 print("\nNo thread request was captured, so API paging is not possible.")
                 print("Falling back to scrolling the UI.")
                 use_api = False
+            if use_api:
+                await offer_resume()
             while True:
                 state["pause"] = state["quit"] = False
                 try:

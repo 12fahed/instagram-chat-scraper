@@ -72,6 +72,12 @@ refusing to load them costs nothing and removes the biggest source of memory
 pressure; `--images` turns the blocking off. The files themselves are fetched later
 by `analyze build --media`.
 
+**If the browser dies, the run stops and says so** — it does not reopen or retry by
+itself. Run the script again and, once the chat is open, it offers to continue from
+the furthest-back cursor already saved in `data/captures`, so it picks up where it
+stopped instead of re-fetching everything above that point. Press Enter to continue,
+or `f` to start again from the newest messages.
+
 Re-running continues the file numbering instead of overwriting the previous run.
 
 **Ctrl+C pauses rather than quits.** The first Ctrl+C stops at the end of the
