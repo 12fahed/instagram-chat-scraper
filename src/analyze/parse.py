@@ -31,8 +31,11 @@ MEDIA_CONTENT = {
     "SlideMessageRavenImageContent": "image",
     "SlideMessageRavenVideoContent": "video",
     "SlideMessageVideosContent": "video",
+    "SlideMessageAudiosContent": "audio",
     "SlideMessageAnimatedMediaContent": "animation",
 }
+
+MEDIA_NOUNS = {"image": "Photo", "video": "Video", "audio": "Voice message", "animation": "GIF"}
 
 
 def _s(v: Any) -> str | None:
@@ -81,8 +84,10 @@ def _media_items(content: dict, typename: str) -> list[dict]:
         # inside are identical either way.
         one = content.get("attachment")
         raw = ([one] if isinstance(one, dict)
-               else (content.get("attachments") or content.get("videos") or []))
+               else (content.get("attachments") or content.get("videos")
+                     or content.get("audio_attachments") or []))
 
+    kind = MEDIA_CONTENT[typename]
     items = []
     for att in raw:
         if not isinstance(att, dict):
@@ -91,6 +96,13 @@ def _media_items(content: dict, typename: str) -> list[dict]:
         if animated:
             preview = preview or _s(att.get("attachment_webp_url"))
             full = _s(att.get("attachment_mp4_url")) or _s(att.get("attachment_webp_url"))
+        elif kind == "audio":
+            # A voice note has nothing to show, only something to play. The only
+            # sample in hand has audio_attachments: [], so the populated field
+            # names are taken from the attachment interface the other media
+            # families share; playable_url is read as well in case it differs.
+            preview = None
+            full = _s(att.get("attachment_cdn_url")) or _s(att.get("playable_url"))
         else:
             full = _s(att.get("attachment_cdn_url"))
         # *_cdn_fallback_url is a bare path into IG's media_fallback endpoint, not a
@@ -98,8 +110,14 @@ def _media_items(content: dict, typename: str) -> list[dict]:
         preview, full = _usable(preview), _usable(full)
         if not preview and not full:
             continue
+        duration = next(
+            (att[k] for k in ("playable_duration_ms", "duration_ms", "duration")
+             if isinstance(att.get(k), (int, float))),
+            None,
+        )
         items.append({
-            "kind": MEDIA_CONTENT[typename],
+            "kind": kind,
+            "duration_ms": duration,
             # No preview but a real original: show a labelled tile rather than
             # stretching a blur placeholder across the bubble.
             "preview": preview,
@@ -129,7 +147,7 @@ def parse_content(node: dict) -> dict:
         if not media:
             # A view-once photo that was consumed, or an attachment IG has dropped:
             # the message is real but carries attachment: null / attachments: [].
-            label = {"image": "Photo", "video": "Video", "animation": "GIF"}[MEDIA_CONTENT[typename]]
+            label = MEDIA_NOUNS[MEDIA_CONTENT[typename]]
             return {
                 "kind": "unavailable",
                 "text": None,

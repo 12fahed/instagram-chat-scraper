@@ -20,6 +20,7 @@ KNOWN_CONTENT = {
     "SlideMessageRavenImageContent",
     "SlideMessageRavenVideoContent",
     "SlideMessageVideosContent",
+    "SlideMessageAudiosContent",
     "SlideMessageAnimatedMediaContent",
     None,  # content: null / content_type NOT_SET - rendered as "Message removed"
 }

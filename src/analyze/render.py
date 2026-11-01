@@ -104,6 +104,12 @@ main{max-width:880px;margin:0 auto;padding:12px 16px 80px}
 .medialink .once{position:absolute;left:8px;top:8px;background:rgba(0,0,0,.55);color:#fff;
   font-size:10px;letter-spacing:.4px;border-radius:999px;padding:2px 7px;pointer-events:none}
 .mediagrid{display:flex;flex-wrap:wrap;gap:3px;max-width:100%}
+.voice{display:flex;align-items:center;gap:10px;background:var(--them);border-radius:22px;
+  padding:7px 12px 7px 10px;max-width:300px}
+.row.me .voice{background:var(--me)}
+.voice audio{height:34px;max-width:230px}
+.voice .dur{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.row.me .voice .dur{color:#e8f2fd}
 .mediadead{border:1px dashed var(--line);border-radius:18px;padding:18px 20px;color:var(--muted);
   font-size:13px;line-height:1.5;text-align:center;min-width:150px}
 .mediadead small{opacity:.75}
@@ -230,7 +236,8 @@ def _avatar(person: dict, cls: str = "av") -> str:
     return f'<div class="{cls}">{_esc(_initials(person))}</div>'
 
 
-MEDIA_LABELS = {"image": "Photo", "video": "Video", "animation": "GIF"}
+MEDIA_LABELS = {"image": "Photo", "video": "Video", "audio": "Voice message",
+                "animation": "GIF"}
 
 
 def _kind_label(entry: dict) -> str:
@@ -307,6 +314,14 @@ def _media_html(media: list[dict]) -> str:
         if item.get("ephemeral"):
             badges += '<span class="once">VIEW ONCE</span>'
         label = _kind_label({"media": [item]})
+        if item.get("kind") == "audio":
+            ms = item.get("duration_ms") or 0
+            spoken = f'<span class="dur">{int(ms // 60000)}:{int(ms // 1000) % 60:02d}</span>' if ms else ""
+            tiles.append(
+                f'<div class="voice"><audio controls preload="none" '
+                f'src="{_esc(item["full"])}"></audio>{spoken}</div>'
+            )
+            continue
         if item.get("placeholder"):
             # The original exists but IG gave us no usable poster frame. Fold the
             # badges into the text - overlaying them makes the tile unreadable.
