@@ -52,15 +52,8 @@ The same conversation, as the official export renders it and as this rebuilds it
 
 | Instagram's official export | This archive |
 | :---: | :---: |
-| ![The same conversation as Instagram's "Download your information" export renders it](docs/images/official-export.png) | ![The same conversation rebuilt by this project](docs/images/this-archive.png) |
+| ![The same conversation as Instagram's "Download your information" export renders it](docs/images/ig-exported.png) | ![The same conversation rebuilt by this project](docs/images/scrapper-formatter.png) |
 | replies detached, shares reduced to links | replies quoted inline, shares as cards |
-
-<!--
-  Screenshots go in docs/images/ :
-    official-export.png - a chat opened from Instagram's "Download your information" export
-    this-archive.png    - the same chat opened from data/out/chat.html
-  Pick a stretch with a few threaded replies and a shared post, so the difference is obvious.
--->
 
 ## What you get
 
