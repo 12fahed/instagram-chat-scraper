@@ -1,232 +1,250 @@
 # scrape-instagram
 
-Rebuild a readable Instagram DM archive from the GraphQL responses the web app
-actually uses, because the official "Download your information" export drops
-the parts that make a conversation make sense.
+Rebuild a complete, readable archive of one Instagram direct-message thread from
+the network responses Instagram's own web app makes — because the official data
+export throws away most of what makes a conversation legible.
 
-## Why
+Everything stays on your machine.
 
-In the account export (both the JSON and HTML flavours) every message is a flat,
-standalone entity. A reply is just another message — the export does not say what
-it was replying to, and shared posts/reels/stories come through as bare links or
-not at all. The `fetch__SlideThread` GraphQL query that instagram.com itself calls
-when you scroll a chat returns the full object, including the **entire replied-to
-message nested inside the reply** and structured attachment cards.
+## Why this exists
 
-So: drive the real web app, record the responses, rebuild the thread offline.
+Request "Download your information" from Instagram, open the `messages` folder,
+and every message is a flat, standalone row. In both the JSON and the HTML
+flavours:
 
-## Layout
+- **replies lose their target.** A reply is just another message; nothing records
+  what it was replying to, so a conversation full of threaded replies reads as
+  disconnected fragments.
+- **shared posts, reels and stories** arrive as bare links or not at all.
+- **reactions, voice notes, view-once media and system events** are flattened or
+  missing.
 
-```
-src/capture.py            Playwright: arm on Enter, record the chat opening,
-                          auto-scroll up, save responses to data/captures/
-src/analyze/              Offline: read captures -> normalised chat -> HTML
-  load.py                 find SlideMessage nodes in any capture shape
-  parse.py                raw node -> render-ready message
-  schema.py               structural report + "what did we not understand"
-  render.py               single self-contained Instagram-like HTML page
-  media.py                optional: mirror IG CDN images locally
-src/inspect_captures.py   older ad-hoc explorer (kept for poking at new shapes)
-src/build_html.py         older generic renderer (superseded by src/analyze)
-data/sample/              two consecutive scrolls, used to develop the parser
-data/captures/            a real run's responses (gitignored)
-data/out/                 generated output (gitignored)
-```
+Open the same conversation on instagram.com and it renders correctly, because the
+web app calls a GraphQL query that returns far more: each reply carries the
+**entire message it replies to, nested inside it**, plus structured attachment
+cards, reactions with their senders, and the message type.
 
-Everything stays local. `data/` is gitignored. The only network access in
-`src/analyze` is the optional `--media` download, and only to instagram/fbcdn hosts.
+So rather than fight the export: drive the real web app, record what it receives,
+and rebuild the thread offline from that.
 
-## Use
+## What you get
 
-### Capture
+- `data/captures/` — every raw response, exactly as received, written as it arrives
+- `data/out/chat.json` — one normalised, de-duplicated message list
+- `data/out/chat*.html` — a self-contained, Instagram-like reading view: reply
+  quotes that jump to the quoted message, reactions, media, day and time dividers,
+  search, and a dark mode
+- `data/out/report.txt` — what was captured, whether it is complete, and whether
+  anything in it was not understood
 
-```bash
-python src/capture.py
-```
+All of `data/` is gitignored.
 
-Recording is off until you press Enter, and you press it **before** opening the
-chat — so the first thread request, the bottom of the conversation, is recorded
-too. After that the script waits for the chat to actually open (it watches for the
-first response carrying messages), settles, then keeps going on its own.
+## How it works, in short
 
-By default it does **not** scroll. Once the thread is open it has a genuine
-`IGDMessageListOffMsysQuery` request in hand, so it replays that request from
-inside the page with the next `end_cursor`, over and over, until
-`has_next_page: false`. Nothing accumulates in the DOM, so there is no memory
-ceiling, each page chains exactly off the last, and it runs far faster than
-scrolling. The replayed request is the page's own — same body, same headers, same
-session — with only the cursor changed; it is held in memory for the run and never
-written to disk, which is why `clean_request()` strips the auth fields from
-everything that *is* saved.
+1. **Capture** opens a real Chromium with a persistent profile, so you log in once.
+   Nothing is recorded until you press Enter.
+2. You open the conversation. Its first request is recorded, and that request is
+   kept in memory as a **template**.
+3. From then on the tool stops touching the UI. It replays that same request from
+   inside the page with the next pagination cursor, over and over, until Instagram
+   says there is nothing older. Each response is saved the moment it lands.
+4. **Analyse** reads those files offline, normalises every message shape it knows,
+   and writes the JSON and the HTML.
 
-`--scroll` goes back to driving the UI. That is what the page itself does, but
-Instagram's DM pane does not virtualise: every message you scroll past stays in the
-DOM with its images decoded, and the renderer dies at roughly 19–23k messages
-(observed twice, at 931 and 1,171 pages). It stops when Instagram reports
-`has_next_page: false` and two more scrolls stay quiet, or after 10 scrolls with
-nothing new — and says which, so you know whether you really reached the top.
+Nothing is sent anywhere. The only outbound traffic is to Instagram itself, plus
+the optional media download, which goes to Instagram's own CDN.
 
-Images, video and fonts are **blocked at the network layer** in both modes. The
-archive takes every media URL from the JSON, never from the rendered page, so
-refusing to load them costs nothing and removes the biggest source of memory
-pressure; `--images` turns the blocking off. The files themselves are fetched later
-by `analyze build --media`.
+For the mechanics — the query shape, the message types, how pagination and
+resuming work — see [docs/DEVELOPERS.md](docs/DEVELOPERS.md).
 
-**If the browser dies, the run stops and says so** — it does not reopen or retry by
-itself. Run the script again and, once the chat is open, it offers to continue from
-the furthest-back cursor already saved in `data/captures`, so it picks up where it
-stopped instead of re-fetching everything above that point. Press Enter to continue,
-or `f` to start again from the newest messages.
+## Requirements
 
-Re-running continues the file numbering instead of overwriting the previous run.
-
-**Ctrl+C pauses rather than quits.** The first Ctrl+C stops at the end of the
-current round and **turns recording off**, so you can scroll, open a reply or go
-look at something else without any of it landing in `data/captures`. Then type `r`
-to resume — recording comes back on and it continues from the last cursor (or,
-in `--scroll` mode, from wherever the pane now sits) — or just Enter to stop. A second Ctrl+C stops the run — in-loop if it lands
-before the round ends, otherwise by answering the pause prompt; either way it stops.
-
-**The browser is never closed behind your back.** Whatever ends the run — the top of
-the thread, a stall, a renderer crash, an unexpected error — the script prints what
-happened and leaves Chromium open. If the chat pane is still alive you can type `r`
-to carry on scrolling *from where it stopped*, which matters: a crash 1,100 pages in
-would otherwise mean walking the whole thread again. A transient `page.evaluate`
-failure is retried five times (re-finding the chat pane each time) before it counts
-as fatal.
-
-On a long run the likeliest crash is Chromium running out of memory — the chat pane
-keeps every message you scrolled past, plus its images, in the DOM. Nothing is lost
-when that happens: responses are written as they arrive.
-
-### Rebuild
+- Python 3.10+ (uses `X | None` type syntax and the walrus operator)
+- [Playwright](https://playwright.dev/python/) with Chromium
+- An Instagram account that can open the conversation in a browser
+- Disk: raw captures run roughly 60 KB per 20-message page, so a 90,000-message
+  thread is a few hundred MB of JSON, plus a similar amount again for the HTML
 
 ```bash
-python -m src.analyze report data/captures
-python -m src.analyze build  data/captures --me <your-username> --media
+python -m venv venv
+source venv/bin/activate
+pip install playwright
+playwright install chromium
 ```
 
-The same commands work on the bundled sample:
+No other dependencies — the analyser is standard library only.
+
+## Usage
+
+### 1. Capture the thread
 
 ```bash
-python -m src.analyze report data/sample
-python -m src.analyze build  data/sample --me <your-username> --media
+python -m src.capture
 ```
 
-`report` describes what is in the captures and, importantly, lists anything the
-parser did not recognise — run it after a real capture so new message types show
-up instead of silently rendering as "Unsupported".
+A Chromium window opens on the DM inbox. Then, in order:
 
-`build` writes `data/out/chat.json` (normalised) plus the HTML (day dividers, reply
-quotes that jump to the quoted message, reaction chips, share cards, photo/video
-bubbles, search, dark mode, system-line toggle).
+1. Log in if needed. **Press Enter in the terminal before you go looking for the
+   conversation** — see the limitation below for why this matters.
+2. Open the conversation you want. The tool waits for it, says
+   `captured the thread query — API paging is available`, and starts.
+3. Leave it running. It prints a line per page and stops on its own when it
+   reaches the beginning of the thread.
 
-`--me` accepts a username, igid or sender id and decides which side is "yours".
+`Ctrl+C` pauses rather than quits: recording stops, the browser is yours to poke
+at, and `r` resumes from the same cursor. A second `Ctrl+C` stops the run. The
+browser is never closed behind your back — on a crash or at the top of the thread
+it stays open and tells you what happened.
 
-`--split` is `auto` by default: over 3,000 messages the archive becomes one page
-per year (`chat-2021.html`, …) with `chat.html` as an index, because a single page
-for a multi-year thread is slow to open and to search. Reply quotes that cross a
-year boundary link into the other file and land on the quoted message. Force it
-either way with `--split year` / `--split none`.
+If the browser dies, just run the command again: it offers to continue from the
+furthest-back cursor already on disk instead of starting over.
 
-`--media` downloads preview images and avatars into `data/out/media/` and rewrites
-the pages to use them — worth doing, because the CDN URLs in a capture are signed
-and expire within days. Video originals are skipped unless you add `--media-video`.
-Anything that fails leaves a visible placeholder rather than vanishing.
+### 2. Check what you captured
 
-## Response shape (from `data/sample`, 2 scrolls / 40 messages)
-
-```
-data.fetch__SlideThread.as_ig_direct_thread.slide_messages
-  edges[].node          one message
-  page_info             start_cursor / end_cursor / has_next_page / has_previous_page
+```bash
+python -m src.analyze report
 ```
 
-20 messages per page, newest first. Pages are contiguous: the two sample scrolls
-meet with 31 seconds between them and zero overlap.
+Read four things:
 
-Per node, the fields that matter:
+- **UNHANDLED** should say `every message matched a known shape`. If it lists
+  message ids, the renderer would show those as "Unsupported" — the shape is new
+  and the parser needs a branch for it.
+- **COVERAGE** — the date range, and `unique messages` vs `nodes seen`.
+- **CONTINUITY → cursor chain** — `all N paged requests follow a captured page`
+  means no page was skipped.
+- **rendered as** — a count per message kind; `unknown` should be zero.
 
-| field | notes |
+### 3. Build the reading view
+
+```bash
+python -m src.analyze build --me <your-username>
+```
+
+Open `data/out/chat.html`. Images will be missing at this stage — that is expected.
+
+### 4. Download the media (optional, slow)
+
+```bash
+python -m src.analyze build --me <your-username> --media
+```
+
+One request per image, serially. Expect failures on older messages: Instagram's
+CDN links are signed and expire within days, so anything shared more than a few
+days ago is usually gone. Failures leave a visible placeholder rather than a hole.
+The download caches by URL, so stopping and re-running only fetches what is
+missing.
+
+## Commands and flags
+
+### `python -m src.capture`
+
+| Flag | What it does |
 | --- | --- |
-| `message_id` / `id` | `mid.$...` — contains `.` and `$`, so never use it in a CSS selector |
-| `timestamp_ms` | string, epoch ms |
-| `sender_fbid`, `sender` | `sender.user_dict` carries username, full name, profile pic |
-| `content.__typename` | the real discriminator, see below |
-| `content_type` | `TEXT` / `MESSAGE_INLINE_SHARE` / `MONTAGE_SHARE_XMA` |
-| `replied_to_message` | **the whole quoted message object**, not just an id — this is what the export loses |
-| `reactions[]` | `{reaction: "😂", sender_fbid}` |
-| `msg_reactions[]` | same reactors, ids only; redundant with `reactions` |
-| `mentions[]`, `slide_edit_history[]`, `is_pinned`, `igd_is_forwarded` | empty in the sample, carried through anyway |
+| *(none)* | Replay the thread's own GraphQL query, cursor by cursor. Constant memory, no ceiling on thread length. |
+| `--scroll` | Drive the UI by scrolling instead. Slower, and the renderer runs out of memory at roughly 20,000 messages — kept as a fallback if a replayed request is ever refused. |
+| `--images` | Let the page load images, video and fonts. Off by default: media URLs come from the JSON, never from the rendered page, so loading them only costs memory. |
+| `--delay N` | Seconds between paged requests (default `1.2`, jittered). Raise it if Instagram starts refusing requests. |
 
-`content.__typename` splits several ways:
+### `python -m src.analyze report [input]`
 
-- `SlideMessageText` — plain text in `content.text_body`.
-- `SlideMessageAdminText` — system line, text in `content.text_fragments[].plaintext`.
-  In the sample these are all `is_reaction_action_log: true` ("Reacted 😡 to your
-  message"), i.e. duplicates of `reactions[]`. The HTML shows them behind the
-  **System** toggle.
-- `SlideMessageXMAContent` — an attachment card, further split by `content.xma.__typename`:
-  - `SlideMessagePortraitXMA` — post / reel / story share. Has `preview_image`
-    (+`width`/`height`/`preview_image_decoration_type`: `REEL`, `COLLAGE`,
-    `INSTAGRAM_ICON`), `header_title_text` + `header_icon` for the author,
-    `target_url`, and `eyebrow_text` for story context.
-  - `SlideMessageStandardXMA` — either a share with no preview (the post's caption
-    sits in `title_text`, link in `target_url`) or the `"Message expired"` tombstone
-    (empty `target_url`).
-  - `SlideMessagePlaceholderXMA` — `"Message unavailable"`, deleted or privacy-hidden.
-  - `SlideMessageExpiredPlaceholderXMA` — an expired story share.
-- `SlideMessageImageContent` / `SlideMessageRavenImageContent` /
-  `SlideMessageRavenVideoContent` / `SlideMessageAnimatedMediaContent` — media sent
-  straight into the chat rather than shared. "Raven" is Meta's name for
-  disappearing / view-once media. All four expose the same fields
-  (`preview_cdn_url`, `attachment_cdn_url`, `preview_width/height`,
-  `attachment_fbid`); they differ only in `attachment` vs `attachments[]` vs
-  `animated_media[]`, and animated media uses `attachment_webp_url` /
-  `attachment_mp4_url` instead.
-- `content: null` with `content_type: "NOT_SET"` — an empty shell, no
-  `tombstone_reason`. Rendered as "Message removed" rather than dropped.
+Describes the captures and flags anything unrecognised. `input` defaults to
+`data/captures`. `-o/--out` sets where `report.txt` is written (default `data/out`).
 
-Two traps in the media urls:
+### `python -m src.analyze build [input]`
 
-- IG encodes the render size as `_s<W>x<H>` in the path. A view-once photo that has
-  already been consumed comes back as a **12×12 blur with no larger url anywhere** —
-  there is no image left. Those attachments are dropped so the message falls through
-  to the "unavailable" tombstone instead of rendering a smudge.
-- `*_cdn_fallback_url` is a bare path into IG's `media_fallback` endpoint, not a
-  usable URL, so it is ignored.
+| Flag | What it does |
+| --- | --- |
+| `--me <id>` | Which participant is you — a username, numeric id or display name. Decides which side of the conversation is on the right. |
+| `--title <text>` | Page title. |
+| `--split auto\|month\|year\|none` | How to break up the archive. `auto` (default) keeps one page under 3,000 messages, splits by year above that, and by month above 20,000. A busy year can be 80,000 messages, which is too much for one page. |
+| `--media` | Download images and avatars into `data/out/media/` and point the pages at the local copies. |
+| `--media-video` | With `--media`, also download video originals. Large, and the least likely to still resolve. |
+| `-o/--out <dir>` | Output directory (default `data/out`). |
 
-Sample breakdown: 15 text, 10 shares, 9 unavailable/expired, 5 system lines,
-1 story share; 11 replies and 6 reacted messages — all 11 replies resolved to a
-message inside the same two scrolls.
+## How this was tested
 
-A participant can come back **unhydrated**: blank `name`, `user_dict: null`, only an
-`igid` — a deleted account or someone who left. They are a real sender, so their
-messages are kept, but they do not count toward "is this a group" (which decides
-whether every incoming bubble gets a name label) and labels fall back to the igid.
+End to end, against a real account, on two separate conversations — one of about
+94,000 messages over three and a half years, another of about 94,000 over six
+months. The run used was:
 
-## Capture notes
+1. `python -m src.capture`
+2. log in, land on the inbox
+3. find the conversation in the inbox list
+4. press Enter in the terminal to start recording
+5. click into the conversation and scroll it once, so the first thread request fires
+6. leave it alone — the tool takes over and pages to the beginning by itself
 
-- Pages are contiguous by construction, so a time gap between two captured pages is
-  usually just a quiet stretch, not a missed scroll. The only hard check is the
-  cursor chain, which needs the *request* variables — `capture.py` records those, so
-  `report` verifies it automatically on real captures (the raw sample bodies can't be
-  checked and the report says so).
-- `capture.py` strips auth tokens (`fb_dtsg`, `lsd`, …) before writing anything, and
-  writes under `data/` so the gitignore covers captured conversations.
-- `src/analyze` reads raw response bodies, `capture.py` records, lists of either,
-  and `.jsonl` — so it works on `data/sample` and on a full run unchanged.
+Afterwards, `analyze report` confirmed the capture: zero duplicate message ids, an
+unbroken cursor chain across every paged request, and no unrecognised message
+shapes. The parser and renderer were also exercised against a synthetic thread
+containing one of every message kind.
 
+The individual pieces — request rewriting, the capture loops, pause and resume,
+crash handling, the resume-from-disk cursor — were tested with a stubbed browser,
+since those paths are hard to trigger on demand against the real site.
 
+## Known limitations
 
------------
+**The newest ~20 messages can be missing.** Scrolling the inbox list to find a
+conversation makes Instagram prefetch that thread's most recent messages. If that
+happens before you press Enter, those messages are already in the browser's cache,
+so opening the conversation does not re-request them and they never appear in a
+recorded response. *Work around it by pressing Enter before you scroll the inbox
+at all* — or, if you have already captured, scroll up and back down inside the
+open conversation to force a refetch.
 
-Instagram reports no older messages left — reached the top of the thread.
+**Media expires.** Instagram's CDN URLs are signed and short-lived. The archive
+always keeps the URLs, but `--media` can only download what is still being served,
+which in practice means recent messages.
 
-935 responses in /home/fahed/Fahed/Personal/scrape-instagram/data/captures
-18636 unique messages across 932 thread pages
-range: 2020-03-26 13:04  ..  2024-10-24 18:51
+**View-once media is unrecoverable.** Consumed view-once photos come back as a
+12×12 blurred placeholder with no full-size version anywhere. These are shown as
+"Photo unavailable" rather than as a meaningless smudge.
 
-Next: python -m src.analyze report data/captures
+**One thread per capture directory.** `data/captures/` is assumed to hold a single
+conversation. Archive a second one into a different directory, or move the first
+out of the way.
 
------------
+**Instagram can change the query at any time.** This reads an internal, unversioned
+API. If the shape changes, `analyze report` will say so under UNHANDLED rather than
+failing silently.
+
+## Privacy
+
+- Auth tokens (`fb_dtsg`, `lsd`, and friends) are stripped from every request
+  before it is written to disk. The one exception is the in-memory request
+  template used for pagination, which is never written or printed.
+- Captures, output and the browser profile all live under paths that `.gitignore`
+  covers.
+- Nothing is uploaded. There is no telemetry and no third-party service.
+
+## Repo layout
+
+```
+src/capture/          record a thread from the live web app
+  config.py           tunables and fixed values
+  state.py            the single run-state dict
+  util.py             shared helpers
+  terminal.py         stdin, Ctrl+C pausing, end-of-run reports
+  recording.py        saving responses, stripping auth, tracking progress
+  browser.py          launching Chromium, wiring pages, blocking media
+  paging.py           replaying the thread query by cursor (default)
+  scrolling.py        driving the UI (fallback)
+  resume.py           finding and offering the saved cursor
+  __main__.py         entry point
+
+src/analyze/          turn captures into an archive
+  load.py             find message nodes in any capture shape
+  parse.py            raw node -> render-ready message
+  schema.py           the report, including what was not understood
+  render.py           markup for one page
+  pages.py            splitting, navigation and the index
+  assets.py           the stylesheet and script
+  media.py            optional CDN mirroring
+  __main__.py         entry point
+
+data/                 gitignored
+  captures/           raw responses
+  out/                chat.json, chat*.html, media/, report.txt
+```
