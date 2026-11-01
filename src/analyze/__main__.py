@@ -1,10 +1,10 @@
 """CLI for the offline analyser.
 
-    python -m src.analyze report data/sample
-    python -m src.analyze build  data/sample --me __fahedkhan
-    python -m src.analyze build  data/sample --me __fahedkhan --media
+    python -m src.analyze report data/captures
+    python -m src.analyze build  data/captures --me <your-username>
+    python -m src.analyze build  data/captures --me <your-username> --media
 
-Default input is data/sample, default output is data/out (gitignored).
+Default input is data/captures, default output is data/out (both gitignored).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import argparse
 import json
 from pathlib import Path
 
-from . import load, parse, render, schema
+from . import load, pages, parse, schema
 
 
 def _resolve_me(chat: dict, wanted: str | None) -> str | None:
@@ -34,8 +34,8 @@ def main(argv: list[str] | None = None) -> None:
     for name, help_text in (("report", "describe what is in the captures"),
                             ("build", "write chat.json + chat.html")):
         sp = sub.add_parser(name, help=help_text)
-        sp.add_argument("input", nargs="?", default="data/sample", type=Path,
-                        help="capture file or directory (default: data/sample)")
+        sp.add_argument("input", nargs="?", default="data/captures", type=Path,
+                        help="capture file or directory (default: data/captures)")
         sp.add_argument("-o", "--out", default=Path("data/out"), type=Path,
                         help="output directory (default: data/out)")
         if name == "build":
@@ -48,16 +48,16 @@ def main(argv: list[str] | None = None) -> None:
             sp.add_argument("--split", choices=("auto", "month", "year", "none"),
                             default="auto",
                             help="split the archive into one page per month or year "
-                                 f"(auto: by year over {render.YEAR_THRESHOLD:,} messages, "
-                                 f"by month over {render.MONTH_THRESHOLD:,})")
+                                 f"(auto: by year over {pages.YEAR_THRESHOLD:,} messages, "
+                                 f"by month over {pages.MONTH_THRESHOLD:,})")
 
     args = ap.parse_args(argv)
     files = load.collect_files(args.input)
-    pages = load.load_pages(files)
-    chat = parse.build(pages)
+    captured = load.load_pages(files)
+    chat = parse.build(captured)
 
     if args.cmd == "report":
-        text = schema.report(pages, chat)
+        text = schema.report(captured, chat)
         print(text)
         args.out.mkdir(parents=True, exist_ok=True)
         (args.out / "report.txt").write_text(text + "\n", encoding="utf-8")
@@ -76,8 +76,8 @@ def main(argv: list[str] | None = None) -> None:
                     "messages": chat["messages"]}, ensure_ascii=False, indent=1),
         encoding="utf-8",
     )
-    pages = render.render_all(chat, me, args.title, args.split)
-    for name, page in pages.items():
+    written = pages.render_all(chat, me, args.title, args.split)
+    for name, page in written.items():
         (args.out / name).write_text(page, encoding="utf-8")
 
     msgs = chat["messages"]
@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> None:
     if unknown:
         print(f"WARNING: {unknown} messages still render as Unsupported — run `report`")
     print(f"written: {json_path}")
-    for name in sorted(pages):
+    for name in sorted(written):
         print(f"         {args.out / name}")
 
 
