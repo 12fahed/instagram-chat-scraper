@@ -1,4 +1,4 @@
-# instagram-chat-scrapper
+# instagram-chat-scraper
 
 Rebuild a complete, readable archive of one Instagram direct-message thread from
 the network responses Instagram's own web app makes — because the official data
@@ -85,7 +85,7 @@ The same conversation, as the official export renders it and as this rebuilds it
 
 | Instagram's official export | This archive |
 | :---: | :---: |
-| ![The same conversation as Instagram's "Download your information" export renders it](docs/images/ig-exported.png) | ![The same conversation rebuilt by this project](docs/images/scrapper-formatter.png) |
+| ![The same conversation as Instagram's "Download your information" export renders it](docs/images/ig-exported.png) | ![The same conversation rebuilt by this project](docs/images/scraper-formatter.png) |
 | replies detached, shares reduced to links | replies quoted inline, shares as cards |
 
 ## What you get

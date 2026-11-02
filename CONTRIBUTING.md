@@ -35,7 +35,7 @@ In issues, PRs and code comments, refer to participants as **userA** and
 
 ```bash
 git clone <your fork>
-cd instagram-chat-scrapper
+cd instagram-chat-scraper
 python -m venv venv
 source venv/bin/activate
 pip install playwright

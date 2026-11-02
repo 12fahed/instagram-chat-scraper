@@ -1,4 +1,4 @@
-# instagram-chat-scrapper — how it works
+# instagram-chat-scraper — how it works
 
 Technical notes for anyone changing this. For what it is and how to run it, see
 the [README](../README.md).
